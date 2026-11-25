@@ -2,6 +2,14 @@ export type CodexApprovalKind = "command" | "file" | "permissions";
 
 export type CodexApprovalDecision = "accept" | "decline";
 
+export type CodexApprovalPolicy = "untrusted" | "on-request" | "never";
+
+export function parseCodexApprovalPolicy(value: unknown): CodexApprovalPolicy | undefined {
+  if (value === undefined || value === null || value === "inherit") return undefined;
+  if (value === "untrusted" || value === "on-request" || value === "never") return value;
+  throw new Error("Invalid codexApprovalPolicy. Expected inherit, untrusted, on-request, or never");
+}
+
 export type CodexApprovalRequest = {
   kind: CodexApprovalKind;
   threadId: string;
@@ -15,7 +23,8 @@ export type CodexApprovalRequest = {
 };
 
 export type CodexApprovalHandler = (
-  request: CodexApprovalRequest
+  request: CodexApprovalRequest,
+  signal?: AbortSignal
 ) => Promise<CodexApprovalDecision> | CodexApprovalDecision;
 
 export type AppServerApprovalMethod =

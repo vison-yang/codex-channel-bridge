@@ -8,15 +8,26 @@ import {
   appServerApprovalResult,
   isAppServerApprovalMethod,
   parseAppServerApproval,
-  type CodexApprovalHandler
+  type AppServerApprovalMethod,
+  type CodexApprovalDecision,
+  type CodexApprovalHandler,
+  type CodexApprovalPolicy,
+  type CodexApprovalRequest
 } from "./approval.js";
-import { CodexRunError, notifyExecutionStarted } from "./run-lifecycle.js";
+import {
+  CodexRunError,
+  DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
+  DEFAULT_CODEX_TURN_TIMEOUT_MS,
+  notifyExecutionStarted
+} from "./run-lifecycle.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 
 export type AppServerRunnerOptions = {
   codexBin?: string;
   requestTimeoutMs?: number;
+  turnTimeoutMs?: number;
   sandbox?: CodexExecSandbox;
+  approvalPolicy?: CodexApprovalPolicy;
 };
 
 export type CodexRunnerInput = {
@@ -24,6 +35,7 @@ export type CodexRunnerInput = {
   cwd: string;
   threadId?: string;
   queueKey?: string;
+  turnTimeoutMs?: number;
   model?: string;
   effort?: string;
   onExecutionStarted?: () => void;
@@ -129,12 +141,30 @@ type ActiveTurn = {
   threadId: string;
   turnId: string;
   queueKey?: string;
+  onApproval?: CodexApprovalHandler;
+  approvals: Map<JsonRpcId, AbortController>;
+};
+
+type ApprovalCall = {
+  id: JsonRpcId;
+  method: AppServerApprovalMethod;
+  request: CodexApprovalRequest;
+};
+
+type StartingTurnApprovals = {
+  starts: number;
+  calls: Map<JsonRpcId, ApprovalCall>;
+};
+
+type StartedTurn = {
+  child: ChildProcessWithoutNullStreams;
+  turnId: string;
 };
 
 type TurnWaiter = {
   resolve: (value: CodexRunResult) => void;
   reject: (error: Error) => void;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
   refresh: () => void;
 };
 
@@ -173,6 +203,28 @@ type WireMessage = {
   };
 };
 
+// 只有携带轮次标识的工作通知能刷新执行计时。
+const turnActivityMethods = new Set([
+  "item/started",
+  "item/completed",
+  "item/agentMessage/delta",
+  "item/reasoning/summaryPartAdded",
+  "item/reasoning/summaryTextDelta",
+  "item/reasoning/textDelta",
+  "item/commandExecution/outputDelta",
+  "item/commandExecution/terminalInteraction",
+  "item/fileChange/outputDelta",
+  "item/fileChange/patchUpdated",
+  "item/mcpToolCall/progress",
+  "item/autoApprovalReview/started",
+  "item/autoApprovalReview/completed",
+  "item/plan/delta",
+  "rawResponseItem/completed",
+  "thread/tokenUsage/updated",
+  "turn/diff/updated",
+  "turn/plan/updated"
+]);
+
 export class AppServerCodexRunner {
   private child?: ChildProcessWithoutNullStreams;
   private lines?: readline.Interface;
@@ -183,7 +235,7 @@ export class AppServerCodexRunner {
   private stderr = "";
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private readonly activeTurns = new Map<string, ActiveTurn>();
-  private readonly approvalHandlersByThread = new Map<string, CodexApprovalHandler>();
+  private readonly startingTurnApprovals = new Map<string, StartingTurnApprovals>();
   private readonly dynamicToolHandlersByThread = new Map<string, CodexDynamicToolHandler>();
   private readonly userInputHandlersByThread = new Map<string, CodexUserInputHandler>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
@@ -206,6 +258,7 @@ export class AppServerCodexRunner {
       await this.waitForThreadIdle(input.threadId, input.onProgress);
     }
 
+    const approvalPolicy = input.ephemeral ? "never" : this.options.approvalPolicy;
     const threadResponse = await this.request(
       input.threadId ? "thread/resume" : "thread/start",
       compactObject({
@@ -213,7 +266,9 @@ export class AppServerCodexRunner {
         ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
         cwd: input.cwd,
         model: input.model,
-        approvalPolicy: "never",
+        // 默认由 Codex 按 cwd 解析项目权限，内部分类固定为只读且不发起审批。
+        approvalPolicy,
+        sandbox: input.ephemeral ? input.sandbox : undefined,
         ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
       })
     ) as Record<string, unknown>;
@@ -236,7 +291,7 @@ export class AppServerCodexRunner {
       threadId,
       input: [{ type: "text", text: input.prompt, text_elements: [] }],
       cwd: input.cwd,
-      approvalPolicy: input.onApproval ? "on-request" : "never",
+      approvalPolicy,
       sandboxPolicy: appServerSandboxPolicy(input.sandbox ?? this.options.sandbox),
       model: input.model,
       effort: input.effort,
@@ -252,8 +307,7 @@ export class AppServerCodexRunner {
         }
       } : {})
     });
-    let turnResponse: Record<string, unknown>;
-    if (input.onApproval) this.approvalHandlersByThread.set(threadId, input.onApproval);
+    let started: StartedTurn;
     if (input.onDynamicToolCall) this.dynamicToolHandlersByThread.set(threadId, input.onDynamicToolCall);
     if (input.onUserInput) this.userInputHandlersByThread.set(threadId, input.onUserInput);
     // 同一批输出可能先交付通知，再由 run 处理 turn/start 响应。
@@ -262,20 +316,18 @@ export class AppServerCodexRunner {
       : undefined;
     if (pendingObservations) this.pendingTurnObservations.set(threadId, pendingObservations);
     try {
-      turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+      started = await this.startTurn(threadId, turnParams, input);
     } catch (error) {
       if (!input.threadId || !isThreadBusyError(error)) {
-        this.approvalHandlersByThread.delete(threadId);
         this.dynamicToolHandlersByThread.delete(threadId);
         this.userInputHandlersByThread.delete(threadId);
         throw error;
       }
-      await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
-      await this.waitForThreadIdle(input.threadId);
       try {
-        turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+        await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
+        await this.waitForThreadIdle(input.threadId);
+        started = await this.startTurn(threadId, turnParams, input);
       } catch (retryError) {
-        this.approvalHandlersByThread.delete(threadId);
         this.dynamicToolHandlersByThread.delete(threadId);
         this.userInputHandlersByThread.delete(threadId);
         throw retryError;
@@ -285,19 +337,9 @@ export class AppServerCodexRunner {
         this.pendingTurnObservations.delete(threadId);
       }
     }
-    const turn = turnResponse.turn as Record<string, unknown> | undefined;
-    const turnId = typeof turn?.id === "string" ? turn.id : undefined;
-    if (!turnId) {
-      this.approvalHandlersByThread.delete(threadId);
-      this.dynamicToolHandlersByThread.delete(threadId);
-      this.userInputHandlersByThread.delete(threadId);
-      throw new Error("Codex app-server did not return a turn id");
-    }
-
+    const { child, turnId } = started;
+    if (this.child !== child) throw new Error("Codex app-server stdio transport is not connected");
     const key = turnKey(threadId, turnId);
-    if (!this.completedTurns.has(key)) {
-      this.activeTurns.set(threadId, { threadId, turnId, queueKey: input.queueKey });
-    }
     let stream: TurnStream | undefined;
     if (input.onDelta || input.onProgress || input.onActivity || input.onFinalAnswerDelta) {
       stream = {
@@ -313,7 +355,9 @@ export class AppServerCodexRunner {
       }
       this.queuedTurnEvents.delete(key);
     }
-    const completion = this.waitForTurn(threadId, turnId);
+    const timeoutMs = input.turnTimeoutMs ?? this.options.turnTimeoutMs ?? this.options.requestTimeoutMs
+      ?? DEFAULT_CODEX_TURN_TIMEOUT_MS;
+    const completion = this.waitForTurn(threadId, turnId, timeoutMs);
     notifyExecutionStarted(input.onExecutionStarted);
     if (stream) {
       for (const observation of pendingObservations?.get(key) ?? []) {
@@ -425,6 +469,11 @@ export class AppServerCodexRunner {
     }
 
     await this.request("turn/interrupt", { threadId: target.threadId, turnId: target.turnId });
+    if (this.activeTurns.get(target.threadId) === target) {
+      target.onApproval = undefined;
+      this.abortTurnApprovals(target);
+      this.turnWaiters.get(turnKey(target.threadId, target.turnId))?.refresh();
+    }
   }
 
   close(): void {
@@ -457,9 +506,15 @@ export class AppServerCodexRunner {
     this.child = child;
     this.stderr = "";
     this.lines = readline.createInterface({ input: child.stdout });
-    this.lines.on("line", (line) => this.handleMessage(line));
+    this.lines.on("line", (line) => this.handleMessage(child, line));
+    this.lines.once("close", () => {
+      if (this.child === child) this.failTransport(new Error("Codex app-server stdout closed"), true);
+    });
+    child.stdin.on("error", (error) => {
+      if (this.child === child) this.failTransport(error, true);
+    });
     child.stderr.on("data", (chunk: Buffer) => {
-      this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-20_000);
+      if (this.child === child) this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-20_000);
     });
     child.once("error", (error) => this.handleChildFailure(child, error));
     child.once("exit", (code, signal) => {
@@ -482,7 +537,7 @@ export class AppServerCodexRunner {
           experimentalApi: true,
           requestAttestation: false
         }
-      }, Math.min(this.options.requestTimeoutMs ?? 600_000, 60_000));
+      }, Math.min(this.options.requestTimeoutMs ?? DEFAULT_CODEX_REQUEST_TIMEOUT_MS, 60_000));
       this.notify("initialized", {});
       this.initialized = true;
     } catch (error) {
@@ -491,10 +546,60 @@ export class AppServerCodexRunner {
     }
   }
 
+  private async startTurn(
+    threadId: string,
+    params: Record<string, unknown>,
+    input: CodexRunnerInput
+  ): Promise<StartedTurn> {
+    const child = this.child;
+    const starting = input.onApproval
+      ? this.startingTurnApprovals.get(threadId) ?? { starts: 0, calls: new Map<JsonRpcId, ApprovalCall>() }
+      : undefined;
+    if (starting) {
+      starting.starts += 1;
+      this.startingTurnApprovals.set(threadId, starting);
+    }
+    try {
+      const response = await this.request("turn/start", params) as Record<string, unknown>;
+      if (!child || this.child !== child) throw new Error("Codex app-server stdio transport is not connected");
+      const turn = response.turn as Record<string, unknown> | undefined;
+      const turnId = typeof turn?.id === "string" ? turn.id : undefined;
+      if (!turnId) throw new Error("Codex app-server did not return a turn id");
+
+      const active = this.completedTurns.has(turnKey(threadId, turnId)) ? undefined : {
+        threadId,
+        turnId,
+        queueKey: input.queueKey,
+        onApproval: input.onApproval,
+        approvals: new Map<JsonRpcId, AbortController>()
+      };
+      if (active) this.activeTurns.set(threadId, active);
+      // 审批可能与 turn/start 响应同批到达，确认轮次后再交给渠道。
+      const calls = this.startingTurnApprovals.get(threadId)?.calls;
+      if (calls) {
+        for (const call of calls.values()) {
+          if (call.request.turnId !== turnId) continue;
+          calls.delete(call.id);
+          this.handleTurnApproval(child, call, active);
+        }
+      }
+      return { child, turnId };
+    } finally {
+      if (starting && --starting.starts === 0 && this.startingTurnApprovals.get(threadId) === starting) {
+        this.startingTurnApprovals.delete(threadId);
+        if (child) {
+          for (const { id, method, request } of starting.calls.values()) {
+            this.respondToServer(child, { id, result: appServerApprovalResult(method, request, "decline") });
+          }
+        }
+      }
+    }
+  }
+
   private request(
     method: string,
     params: Record<string, unknown>,
-    timeoutMs = this.options.requestTimeoutMs ?? 600_000
+    timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_CODEX_REQUEST_TIMEOUT_MS
   ): Promise<unknown> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -527,7 +632,18 @@ export class AppServerCodexRunner {
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  private handleMessage(raw: string): void {
+  private respondToServer(child: ChildProcessWithoutNullStreams, message: WireMessage): void {
+    // 异步处理结束时，原连接可能已被替换。
+    if (this.child !== child) return;
+    try {
+      this.send(message);
+    } catch (error) {
+      this.failTransport(error instanceof Error ? error : new Error(String(error)), true);
+    }
+  }
+
+  private handleMessage(child: ChildProcessWithoutNullStreams, raw: string): void {
+    if (this.child !== child) return;
     let message: WireMessage;
     try {
       message = JSON.parse(raw) as WireMessage;
@@ -536,7 +652,7 @@ export class AppServerCodexRunner {
     }
 
     if (message.method && message.id !== undefined) {
-      this.handleServerRequest(message);
+      this.handleServerRequest(child, message);
       return;
     }
     if (message.method) {
@@ -562,6 +678,16 @@ export class AppServerCodexRunner {
   }
 
   private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
+    if (turnActivityMethods.has(method)) {
+      const key = turnKeyFromParams(params);
+      if (key) this.turnWaiters.get(key)?.refresh();
+    }
+
+    if (method === "serverRequest/resolved") {
+      this.handleResolvedApproval(params);
+      return;
+    }
+
     if (method === "item/started") {
       const key = turnKeyFromParams(params);
       if (!key) return;
@@ -644,8 +770,11 @@ export class AppServerCodexRunner {
       raw: (this.turnEvents.get(key) ?? []).join("\n"),
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
-    if (this.activeTurns.get(threadId)?.turnId === turnId) this.activeTurns.delete(threadId);
-    this.approvalHandlersByThread.delete(threadId);
+    const active = this.activeTurns.get(threadId);
+    if (active?.turnId === turnId) {
+      this.activeTurns.delete(threadId);
+      this.abortTurnApprovals(active);
+    }
     this.dynamicToolHandlersByThread.delete(threadId);
     this.userInputHandlersByThread.delete(threadId);
     const waiter = this.turnWaiters.get(key);
@@ -658,7 +787,7 @@ export class AppServerCodexRunner {
     void this.finishTurn(threadId, key, completion, waiter.resolve, waiter.reject);
   }
 
-  private waitForTurn(threadId: string, turnId: string): Promise<CodexRunResult> {
+  private waitForTurn(threadId: string, turnId: string, timeoutMs: number): Promise<CodexRunResult> {
     const key = turnKey(threadId, turnId);
     const completed = this.completedTurns.get(key);
     if (completed) {
@@ -668,7 +797,7 @@ export class AppServerCodexRunner {
       });
     }
 
-    const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
+    const active = this.activeTurns.get(threadId);
     return new Promise((resolve, reject) => {
       const expire = () => {
         this.turnWaiters.delete(key);
@@ -679,13 +808,16 @@ export class AppServerCodexRunner {
       const waiter: TurnWaiter = {
         resolve,
         reject,
-        timer: setTimeout(expire, timeoutMs),
         refresh: () => {
           clearTimeout(waiter.timer);
-          waiter.timer = setTimeout(expire, timeoutMs);
+          // 最后一项人工审批结束后，从完整的无活动窗口重新计时。
+          waiter.timer = active?.turnId === turnId && active.approvals.size
+            ? undefined
+            : setTimeout(expire, timeoutMs);
         }
       };
       this.turnWaiters.set(key, waiter);
+      waiter.refresh();
     });
   }
 
@@ -693,7 +825,7 @@ export class AppServerCodexRunner {
     threadId: string,
     onProgress?: (message: string) => Promise<void> | void
   ): Promise<void> {
-    const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
+    const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_CODEX_REQUEST_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
     let notified = false;
     while (true) {
@@ -789,74 +921,125 @@ export class AppServerCodexRunner {
     if (!callback) return;
     stream.chain = stream.chain
       .then(() => callback(event.text))
-      .then(() => this.turnWaiters.get(key)?.refresh())
-      .then(() => undefined)
       .catch((error) => {
         console.warn(`Codex ${event.type} callback failed: ${error instanceof Error ? error.message : String(error)}`);
       });
   }
 
-  private handleServerRequest(message: WireMessage): void {
+  private handleServerRequest(child: ChildProcessWithoutNullStreams, message: WireMessage): void {
     const id = message.id as JsonRpcId;
     if (isAppServerApprovalMethod(message.method)) {
       const method = message.method;
       const request = parseAppServerApproval(method, message.params ?? {});
-      const handler = request ? this.approvalHandlersByThread.get(request.threadId) : undefined;
-      if (!request || !handler) {
-        const fallback = request ?? {
+      if (!request) {
+        const fallback = {
           kind: "command" as const,
           threadId: "",
           turnId: "",
           itemId: ""
         };
-        this.send({ id, result: appServerApprovalResult(method, fallback, "decline") });
+        this.respondToServer(child, { id, result: appServerApprovalResult(method, fallback, "decline") });
         return;
       }
-      Promise.resolve(handler(request))
-        .then((decision) => {
-          this.send({ id, result: appServerApprovalResult(method, request, decision) });
-        })
-        .catch((error) => {
-          try {
-            this.send({ id, result: appServerApprovalResult(method, request, "decline") });
-          } catch (sendError) {
-            const approvalError = error instanceof Error ? error.message : String(error);
-            const transportError = sendError instanceof Error ? sendError.message : String(sendError);
-            console.warn(`Codex approval failed (${approvalError}) and decline could not be sent: ${transportError}`);
-          }
-        });
+      const call = { id, method, request };
+      const active = this.activeTurns.get(request.threadId);
+      if (active?.turnId === request.turnId) {
+        this.handleTurnApproval(child, call, active);
+      } else {
+        const starting = this.startingTurnApprovals.get(request.threadId);
+        if (starting) starting.calls.set(id, call);
+        else this.handleTurnApproval(child, call);
+      }
       return;
     }
     switch (message.method) {
       case "execCommandApproval":
       case "applyPatchApproval":
-        this.send({ id, result: { decision: "denied" } });
+        this.respondToServer(child, { id, result: { decision: "denied" } });
         return;
       case "item/tool/requestUserInput":
-        this.handleUserInputRequest(id, message.params ?? {});
+        this.handleUserInputRequest(child, id, message.params ?? {});
         return;
       case "mcpServer/elicitation/request":
-        this.send({ id, result: { action: "cancel", content: null, _meta: null } });
+        this.respondToServer(child, { id, result: { action: "cancel", content: null, _meta: null } });
         return;
       case "item/tool/call":
-        this.handleDynamicToolRequest(id, message.params ?? {});
+        this.handleDynamicToolRequest(child, id, message.params ?? {});
         return;
       case "currentTime/read":
-        this.send({ id, result: { currentTimeAt: Math.floor(Date.now() / 1_000) } });
+        this.respondToServer(child, { id, result: { currentTimeAt: Math.floor(Date.now() / 1_000) } });
         return;
       default:
-        this.send({
+        this.respondToServer(child, {
           id,
           error: { code: -32601, message: `Unsupported app-server request: ${message.method ?? "unknown"}` }
         });
     }
   }
 
-  private handleDynamicToolRequest(id: JsonRpcId, params: Record<string, unknown>): void {
+  private handleTurnApproval(child: ChildProcessWithoutNullStreams, call: ApprovalCall, active?: ActiveTurn): void {
+    if (this.child !== child) return;
+    const { id, method, request } = call;
+    if (!active?.onApproval) {
+      this.respondToServer(child, { id, result: appServerApprovalResult(method, request, "decline") });
+      return;
+    }
+    if (active.approvals.has(id)) return;
+
+    const controller = new AbortController();
+    active.approvals.set(id, controller);
+    this.turnWaiters.get(turnKey(active.threadId, active.turnId))?.refresh();
+    void this.resolveApproval(child, call, active, active.onApproval, controller);
+  }
+
+  private async resolveApproval(
+    child: ChildProcessWithoutNullStreams,
+    { id, method, request }: ApprovalCall,
+    active: ActiveTurn,
+    handler: CodexApprovalHandler,
+    controller: AbortController
+  ): Promise<void> {
+    let decision: CodexApprovalDecision;
+    try {
+      decision = await handler(request, controller.signal) === "accept" ? "accept" : "decline";
+    } catch {
+      decision = "decline";
+    }
+    if (controller.signal.aborted) return;
+    this.respondToServer(child, { id, result: appServerApprovalResult(method, request, decision) });
+    if (active.approvals.delete(id)) this.turnWaiters.get(turnKey(active.threadId, active.turnId))?.refresh();
+  }
+
+  private handleResolvedApproval(params: Record<string, unknown>): void {
+    const { threadId, requestId } = params;
+    if (typeof threadId !== "string" || (typeof requestId !== "number" && typeof requestId !== "string")) return;
+
+    const active = this.activeTurns.get(threadId);
+    const controller = active?.approvals.get(requestId);
+    if (active && controller) {
+      active.approvals.delete(requestId);
+      controller.abort();
+      this.turnWaiters.get(turnKey(active.threadId, active.turnId))?.refresh();
+    } else {
+      this.startingTurnApprovals.get(threadId)?.calls.delete(requestId);
+    }
+  }
+
+  private abortTurnApprovals(turn: ActiveTurn): void {
+    const approvals = [...turn.approvals.values()];
+    turn.approvals.clear();
+    for (const controller of approvals) controller.abort();
+  }
+
+  private handleDynamicToolRequest(
+    child: ChildProcessWithoutNullStreams,
+    id: JsonRpcId,
+    params: Record<string, unknown>
+  ): void {
     const call = parseDynamicToolCall(params);
     const handler = call ? this.dynamicToolHandlersByThread.get(call.threadId) : undefined;
     if (!call || !handler) {
-      this.send({
+      this.respondToServer(child, {
         id,
         result: {
           contentItems: [{ type: "inputText", text: "当前会话没有启用该动态工具。" }],
@@ -865,12 +1048,12 @@ export class AppServerCodexRunner {
       });
       return;
     }
-    Promise.resolve(handler(call))
-      .then((text) => this.send({
+    Promise.resolve().then(() => handler(call))
+      .then((text) => this.respondToServer(child, {
         id,
         result: { contentItems: [{ type: "inputText", text }], success: true }
       }))
-      .catch((error) => this.send({
+      .catch((error) => this.respondToServer(child, {
         id,
         result: {
           contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }],
@@ -879,16 +1062,20 @@ export class AppServerCodexRunner {
       }));
   }
 
-  private handleUserInputRequest(id: JsonRpcId, params: Record<string, unknown>): void {
+  private handleUserInputRequest(
+    child: ChildProcessWithoutNullStreams,
+    id: JsonRpcId,
+    params: Record<string, unknown>
+  ): void {
     const request = parseUserInputRequest(params);
     const handler = request ? this.userInputHandlersByThread.get(request.threadId) : undefined;
     if (!request || !handler) {
-      this.send({ id, result: { answers: {} } });
+      this.respondToServer(child, { id, result: { answers: {} } });
       return;
     }
-    Promise.resolve(handler(request))
-      .then((answers) => this.send({ id, result: { answers } }))
-      .catch(() => this.send({ id, result: { answers: {} } }));
+    Promise.resolve().then(() => handler(request))
+      .then((answers) => this.respondToServer(child, { id, result: { answers } }))
+      .catch(() => this.respondToServer(child, { id, result: { answers: {} } }));
   }
 
   private handleChildFailure(child: ChildProcessWithoutNullStreams, error: Error): void {
@@ -917,8 +1104,9 @@ export class AppServerCodexRunner {
       clearTimeout(waiter.timer);
       waiter.reject(error);
     }
+    const activeTurns = [...this.activeTurns.values()];
     this.activeTurns.clear();
-    this.approvalHandlersByThread.clear();
+    this.startingTurnApprovals.clear();
     this.dynamicToolHandlersByThread.clear();
     this.userInputHandlersByThread.clear();
     this.turnEvents.clear();
@@ -930,6 +1118,7 @@ export class AppServerCodexRunner {
     this.itemPhasesByTurn.clear();
     this.runtimeInfoByThread.clear();
     this.modelOptions = undefined;
+    for (const turn of activeTurns) this.abortTurnApprovals(turn);
   }
 }
 

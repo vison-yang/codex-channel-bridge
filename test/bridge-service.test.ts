@@ -418,6 +418,31 @@ test("sends Codex approvals to the originating sender and accepts channel decisi
   assert.match(replies.at(-1)?.text ?? "", /审批结果：accept/);
 });
 
+test("rejects an approval callback after its Codex turn ends", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-approval-ended-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const replies: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    weixin: {
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
+    } as never
+  });
+  const controller = new AbortController();
+  const pending = service.requestApproval("alice@im.wechat", {
+    kind: "command", threadId: "thread-ended", turnId: "turn-ended", itemId: "item-ended"
+  }, controller.signal);
+
+  controller.abort();
+  assert.equal(await pending, "decline");
+  await service.handleMessage({
+    id: "approve-ended", senderId: "alice@im.wechat", text: "/ok A1", attachments: [], raw: {}
+  });
+  assert.match(replies.at(-1) ?? "", /审批可能已失效/);
+});
+
 test("automatically declines unanswered channel approvals after the timeout", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-approval-timeout-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -427,9 +452,8 @@ test("automatically declines unanswered channel approvals after the timeout", as
   const replies: string[] = [];
   let decision: string | undefined;
   const service = new BridgeService({
-    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"], codexApprovalTimeoutMs: 10 },
     stateStore,
-    approvalTimeoutMs: 10,
     weixin: {
       async sendTyping() {},
       async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
@@ -452,6 +476,7 @@ test("automatically declines unanswered channel approvals after the timeout", as
   });
 
   assert.equal(decision, "decline");
+  assert.ok(replies.some((reply) => /1 秒内未处理/.test(reply)));
   assert.ok(replies.some((reply) => /审批 A1 已超时.*自动拒绝/.test(reply)));
 });
 

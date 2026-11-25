@@ -8,9 +8,11 @@ import {
   type CodexThreadGoalStatus
 } from "./app-server-runner.js";
 import { CodexExecRunner, type CodexRunResult } from "./exec-runner.js";
-import { codexFailureOutcome } from "./run-lifecycle.js";
+import { DEFAULT_CODEX_REQUEST_TIMEOUT_MS, DEFAULT_CODEX_TURN_TIMEOUT_MS, codexFailureOutcome } from "./run-lifecycle.js";
+import type { CodexApprovalPolicy } from "./approval.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import type { CodexAccountBalance } from "./account-balance.js";
+import type { CodexWeixinConfig } from "../state/config.js";
 
 export type CodexBackend = "auto" | "app-server" | "exec";
 
@@ -18,7 +20,10 @@ export type HybridCodexRunnerOptions = {
   backend: CodexBackend;
   codexBin?: string;
   execSandbox?: CodexExecSandbox;
+  approvalPolicy?: CodexApprovalPolicy;
   timeoutMs?: number;
+  requestTimeoutMs?: number;
+  turnTimeoutMs?: number;
 };
 
 export type EphemeralCodexRunnerInput = {
@@ -35,15 +40,19 @@ export class HybridCodexRunner {
   private readonly runTails = new Map<string, Promise<void>>();
 
   constructor(private readonly options: HybridCodexRunnerOptions) {
+    const turnTimeoutMs = options.turnTimeoutMs ?? options.timeoutMs ?? DEFAULT_CODEX_TURN_TIMEOUT_MS;
     this.appServer = new AppServerCodexRunner({
       codexBin: options.codexBin,
-      requestTimeoutMs: options.timeoutMs,
-      sandbox: options.execSandbox
+      requestTimeoutMs: options.requestTimeoutMs ?? options.timeoutMs,
+      turnTimeoutMs,
+      sandbox: options.execSandbox,
+      approvalPolicy: options.approvalPolicy
     });
     this.exec = new CodexExecRunner({
       codexBin: options.codexBin,
       sandbox: options.execSandbox,
-      timeoutMs: options.timeoutMs
+      approvalPolicy: options.approvalPolicy,
+      timeoutMs: turnTimeoutMs
     });
   }
 
@@ -114,6 +123,7 @@ export class HybridCodexRunner {
     return this.appServer.run({
       ...input,
       ephemeral: true,
+      turnTimeoutMs: this.options.requestTimeoutMs ?? this.options.timeoutMs ?? DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
       sandbox: "read-only"
     });
   }
@@ -157,4 +167,15 @@ export class HybridCodexRunner {
     this.appServer.close();
     this.exec.close();
   }
+}
+
+export function createConfiguredCodexRunner(config: CodexWeixinConfig): HybridCodexRunner {
+  return new HybridCodexRunner({
+    backend: config.codexBackend,
+    codexBin: config.codexBin,
+    execSandbox: config.codexExecSandbox,
+    approvalPolicy: config.codexApprovalPolicy,
+    requestTimeoutMs: config.codexRequestTimeoutMs,
+    turnTimeoutMs: config.codexTurnTimeoutMs
+  });
 }

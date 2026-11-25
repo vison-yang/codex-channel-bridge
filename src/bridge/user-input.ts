@@ -5,6 +5,7 @@ import type {
   CodexUserInputQuestion,
   CodexUserInputRequest
 } from "../codex/app-server-runner.js";
+import { DEFAULT_CODEX_USER_INPUT_TIMEOUT_MS } from "../codex/run-lifecycle.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
 
 type PendingChoice = {
@@ -19,7 +20,7 @@ export class ChannelUserInputController {
 
   constructor(
     private readonly sendCard: (senderId: string, card: ChannelActionCard) => Promise<void>,
-    private readonly defaultTimeoutMs = 5 * 60_000
+    private readonly defaultTimeoutMs = DEFAULT_CODEX_USER_INPUT_TIMEOUT_MS
   ) {}
 
   async request(senderId: string, request: CodexUserInputRequest): Promise<CodexUserInputAnswer> {
@@ -30,7 +31,7 @@ export class ChannelUserInputController {
         question,
         index,
         request.questions.length,
-        request.autoResolutionMs ?? this.defaultTimeoutMs
+        request.autoResolutionMs === undefined ? this.defaultTimeoutMs : Math.max(1_000, request.autoResolutionMs)
       );
       if (answer === undefined) return answers;
       answers[question.id] = { answers: [answer] };
@@ -84,7 +85,7 @@ export class ChannelUserInputController {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         resolve(undefined);
-      }, Math.max(1_000, timeoutMs));
+      }, timeoutMs);
       this.pending.set(requestId, {
         senderId,
         options: options.map((option) => option.label),

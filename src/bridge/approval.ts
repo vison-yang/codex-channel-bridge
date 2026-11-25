@@ -2,15 +2,15 @@ import type {
   CodexApprovalDecision,
   CodexApprovalRequest
 } from "../codex/approval.js";
+import { DEFAULT_CODEX_APPROVAL_TIMEOUT_MS } from "../codex/run-lifecycle.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
-
-const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000;
 
 type PendingApproval = {
   id: string;
   senderId: string;
   resolve: (decision: CodexApprovalDecision) => void;
   timer: NodeJS.Timeout;
+  removeAbortListener?: () => void;
 };
 
 export type ChannelApprovalNotice = {
@@ -24,10 +24,11 @@ export class ChannelApprovalController {
 
   constructor(
     private readonly send: (senderId: string, notice: ChannelApprovalNotice) => Promise<void>,
-    private readonly timeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS
+    private readonly timeoutMs = DEFAULT_CODEX_APPROVAL_TIMEOUT_MS
   ) {}
 
-  request(senderId: string, request: CodexApprovalRequest): Promise<CodexApprovalDecision> {
+  request(senderId: string, request: CodexApprovalRequest, signal?: AbortSignal): Promise<CodexApprovalDecision> {
+    if (signal?.aborted) return Promise.resolve("decline");
     const id = `A${this.nextId++}`;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -36,7 +37,12 @@ export class ChannelApprovalController {
           console.warn(`Unable to send approval timeout ${id}: ${errorDetail(error)}`);
         });
       }, this.timeoutMs);
-      this.pending.set(this.key(senderId, id), { id, senderId, resolve, timer });
+      const onAbort = () => { this.settle(senderId, id, "decline"); };
+      this.pending.set(this.key(senderId, id), {
+        id, senderId, resolve, timer,
+        removeAbortListener: signal ? () => signal.removeEventListener("abort", onAbort) : undefined
+      });
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.send(senderId, approvalNotice(id, request, this.timeoutMs)).catch((error: unknown) => {
         console.warn(`Unable to send approval ${id}: ${errorDetail(error)}`);
         this.settle(senderId, id, "decline");
@@ -46,7 +52,7 @@ export class ChannelApprovalController {
 
   decide(senderId: string, rawId: string, decision: CodexApprovalDecision): string {
     const id = this.resolveId(senderId, rawId);
-    if (!id) return "当前没有待审批请求，或审批编号不属于这个账号。";
+    if (!id) return "当前没有待审批请求。审批可能已失效，或不属于这个账号。";
     this.settle(senderId, id, decision);
     return decision === "accept" ? `已批准审批 ${id}。` : `已拒绝审批 ${id}。`;
   }
@@ -70,6 +76,7 @@ export class ChannelApprovalController {
     if (!pending) return false;
     this.pending.delete(key);
     clearTimeout(pending.timer);
+    pending.removeAbortListener?.();
     pending.resolve(decision);
     return true;
   }
@@ -85,7 +92,10 @@ function approvalNotice(id: string, request: CodexApprovalRequest, timeoutMs: nu
     : request.kind === "file"
       ? ["类型：修改文件", request.grantRoot ? `写入范围：${request.grantRoot}` : undefined]
       : ["类型：申请额外权限", request.permissions ? `权限：${limit(JSON.stringify(request.permissions))}` : undefined];
-  const timeout = `${Math.max(1, Math.ceil(timeoutMs / 60_000))} 分钟内未处理将自动拒绝。`;
+  const duration = timeoutMs % 60_000 === 0
+    ? `${timeoutMs / 60_000} 分钟`
+    : `${Math.ceil(timeoutMs / 1_000)} 秒`;
+  const timeout = `${duration}内未处理将自动拒绝。`;
   const summary = [
     `【Codex 审批 ${id}】`,
     ...details,

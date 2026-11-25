@@ -74,7 +74,7 @@
 
 管理页的“添加渠道”同时支持个人微信扫码、企业微信智能机器人和飞书企业自建应用。企业微信与飞书使用官方长连接 SDK，不需要为本机服务配置公网回调地址。每个 Codex 项目都可以开启“任务结束通知”，选择任一已添加渠道和接收会话（或用户）ID；该项目下从聊天端或 Web 发起的任务，无论成功还是失败，结束后都会发送项目、任务和结果摘要。
 
-聊天端任务需要运行命令、修改文件或申请额外权限时，审批请求会发回发起任务的同一账号和联系人。回复 `/approve A1`（短写 `/ok A1`）批准一次，或 `/reject A1`（短写 `/no A1`）拒绝；10 分钟未回复会自动拒绝。审批编号按账号和联系人隔离，其他渠道或联系人不能代为处理。
+Codex 请求运行命令、修改文件或增加权限的审批时，桥接会将请求发回原账号和联系人。回复 `/approve A1`（短写 `/ok A1`）批准一次，或 `/reject A1`（短写 `/no A1`）拒绝。默认 10 分钟未回复会自动拒绝，可通过 `codexApprovalTimeoutMs` 调整。审批编号按账号和联系人隔离。
 
 <p align="center">
   <img src="docs/images/screenshots/web-multi-account.png" alt="Codex Channel Bridge 多账号管理" width="100%" />
@@ -378,7 +378,22 @@ Codex 可以在最终回复中声明需要发送的本机文件：
 
 默认的 `codexBackend` 是 `auto`。第一次收到 Codex 消息时，服务会启动一个持久的 `codex app-server --stdio` 进程，并使用新版 `initialize`、`thread/*` 和 `turn/*` 协议。新会话和已有会话都优先通过 app-server 运行；如果 app-server 无法启动、握手或处理请求，会自动回退到 `codex exec` 或 `codex exec resume`。
 
-聊天端发起的 app-server turn 使用 `approvalPolicy: "on-request"`。Codex 请求运行命令、修改文件或增加权限时，桥接服务会把请求路由到原账号、原联系人并等待 `/approve` 或 `/reject`；超时、发送失败或找不到对应任务时安全拒绝。带渠道审批的任务不会回退到无法交互审批的 `codex exec`。管理页保存的 `codexExecSandbox` 是兼容旧版本保留的字段名，现在会同时应用到 app-server 主路径和 exec 回退路径；选择“完整访问”时，新建及已绑定会话的后续回合都会以 `danger-full-access` 运行。管理页仍可把后端固定为 `app-server` 或 `exec`，用于排查问题。
+Codex 按会话工作目录加载生效的项目权限、沙箱和审批策略。管理页的“Codex 文件权限”默认沿用 Codex 设置，也可以显式指定 app-server 主路径和 exec 路径的沙箱。Codex 发出审批请求时，桥接服务将请求发到原账号及联系人，并等待 `/approve` 或 `/reject`。超时、发送失败或找不到对应任务时自动拒绝。带渠道审批的任务需要 app-server 后端。
+
+任务的执行无活动时限默认是 24 小时。收到本轮执行活动时重新计时，等待人工审批时暂停计时。每条审批有独立的处理窗口。
+
+在状态目录的 `config.json` 中可设置以下字段。状态目录默认是 `~/.codex-weixin`，也可以由 `CODEX_CHANNEL_BRIDGE_STATE_DIR` 指定。编辑配置文件后重启 Bridge 生效。
+
+| 字段 | 默认值 | 用途 |
+| --- | --- | --- |
+| `codexExecSandbox` | `"inherit"` | 沿用项目文件权限。也可显式选择 `"read-only"`、`"workspace-write"` 或 `"danger-full-access"`。 |
+| `codexApprovalPolicy` | `"inherit"` | 沿用项目审批策略。也可显式选择 `"untrusted"`、`"on-request"` 或 `"never"`。 |
+| `codexTurnTimeoutMs` | `86400000` | 本轮无活动时限，默认 24 小时。 |
+| `codexApprovalTimeoutMs` | `600000` | 每条人工审批的回复时限，默认 10 分钟。 |
+| `codexRequestTimeoutMs` | `600000` | App Server 请求、等待已有会话空闲和内部意图识别轮次的时限。初始化最多等待 60 秒。 |
+| `codexUserInputTimeoutMs` | `300000` | Codex 未指定时限时，每条交互选项的回复时限，默认 5 分钟。 |
+
+时限使用毫秒整数，范围为 `1` 到 `2147483647`。文件沙箱和审批策略省略时也会沿用 Codex 设置，按任务工作目录解析项目权限。
 
 ## 模型和推理强度
 

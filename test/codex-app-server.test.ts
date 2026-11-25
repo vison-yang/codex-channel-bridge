@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 import type { CodexActivityEvent } from "../src/codex/activity.js";
 import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
 import { codexFailureOutcome } from "../src/codex/run-lifecycle.js";
-import { HybridCodexRunner } from "../src/codex/runner.js";
+import { createConfiguredCodexRunner, HybridCodexRunner } from "../src/codex/runner.js";
+import { defaultConfig } from "../src/state/config.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -155,7 +156,8 @@ test("keeps an active channel turn alive from its latest progress reply", async 
   // Given: a turn whose progress arrives before the timeout and final answer arrives after the original deadline.
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
-    requestTimeoutMs: 200
+    requestTimeoutMs: 200,
+    turnTimeoutMs: 200
   });
   t.after(() => runner.close());
 
@@ -171,6 +173,217 @@ test("keeps an active channel turn alive from its latest progress reply", async 
   // Then: the timeout is measured from that reply and the final answer completes.
   assert.deepEqual(progress, ["working:sliding-timeout"]);
   assert.equal(result.text, "reply:sliding-timeout");
+});
+
+for (const observer of ["feishu", "none"] as const) {
+  test(`renews the current turn timeout on tool activity with ${observer} observers`, async (t) => {
+    const runner = new AppServerCodexRunner({
+      codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+      requestTimeoutMs: 500,
+      turnTimeoutMs: 500
+    });
+    t.after(() => runner.close());
+    const events: CodexActivityEvent[] = [];
+
+    const result = await runner.run({
+      prompt: "activity-timeout",
+      cwd: fixturesDir,
+      ...(observer === "feishu" ? {
+        onActivity: (event: CodexActivityEvent) => events.push(event),
+        onFinalAnswerDelta: (_delta: string) => undefined
+      } : {})
+    });
+
+    assert.equal(result.turnId, "turn-1");
+    if (observer === "feishu") {
+      assert.deepEqual(events, [{ id: "activity-1", kind: "command", status: "running" }]);
+    }
+  });
+}
+
+test("ignores activity from an unrelated turn when renewing a timeout", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 500,
+    turnTimeoutMs: 500
+  });
+  t.after(() => runner.close());
+
+  const running = runner.run({ prompt: "foreign-activity-timeout", cwd: fixturesDir });
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await assert.rejects(Promise.race([
+      running,
+      new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("foreign activity extended the turn")), 1_100); })
+    ]), /app-server turn timed out/i);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+});
+
+for (const mode of ["early", "late"] as const) {
+  test(`pauses the turn timeout while ${mode} approval waits and restarts it after the decision`, async (t) => {
+    const runner = new AppServerCodexRunner({
+      codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+      requestTimeoutMs: 500,
+      turnTimeoutMs: 500
+    });
+    t.after(() => runner.close());
+    let release!: (decision: "accept") => void;
+    let approvalSeen!: () => void;
+    const seen = new Promise<void>((resolve) => { approvalSeen = resolve; });
+    const decision = new Promise<"accept">((resolve) => { release = resolve; });
+
+    const running = runner.run({
+      prompt: `approval:${mode}`,
+      cwd: fixturesDir,
+      onApproval: () => {
+        approvalSeen();
+        return decision;
+      }
+    });
+    // Attach a rejection handler before holding the approval across the old deadline.
+    const outcome = running.then((result) => ({ result }), (error: Error) => ({ error }));
+    await Promise.race([seen, outcome.then((settled) => {
+      if ("error" in settled) throw settled.error;
+      throw new Error("turn completed before approval was requested");
+    })]);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    release("accept");
+    const settled = await outcome;
+    if ("error" in settled) throw settled.error;
+    assert.equal(settled.result.text, "approval:command:accept");
+  });
+}
+
+test("keeps the turn paused until every concurrent approval is decided", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 500,
+    turnTimeoutMs: 500
+  });
+  t.after(() => runner.close());
+  const decisions: Array<(decision: "accept") => void> = [];
+  let observed!: () => void;
+  const seen = new Promise<void>((resolve) => { observed = resolve; });
+  const running = runner.run({
+    prompt: "approval:multi",
+    cwd: fixturesDir,
+    onApproval: () => new Promise<"accept">((resolve) => {
+      decisions.push(resolve);
+      if (decisions.length === 2) observed();
+    })
+  });
+  const outcome = running.then((result) => ({ result }), (error: Error) => ({ error }));
+  await Promise.race([seen, outcome.then((settled) => {
+    if ("error" in settled) throw settled.error;
+    throw new Error("turn completed before both approvals were requested");
+  })]);
+  decisions[0]?.("accept");
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  decisions[1]?.("accept");
+  const settled = await outcome;
+  if ("error" in settled) throw settled.error;
+  assert.equal(settled.result.text, "approval:command:accept");
+});
+
+test("aborts all interrupted approvals without cancelling another turn", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000,
+    turnTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  const approvals = new Map<string, Array<{ signal: AbortSignal | undefined; decide: (value: "accept") => void }>>();
+  let observed!: () => void;
+  const allObserved = new Promise<void>((resolve) => { observed = resolve; });
+  const onApproval = (request: { threadId: string }, signal?: AbortSignal) => new Promise<"accept">((decide) => {
+    const pending = approvals.get(request.threadId) ?? [];
+    pending.push({ signal, decide });
+    approvals.set(request.threadId, pending);
+    if ((approvals.get("thread-first")?.length ?? 0) === 2 && approvals.has("thread-second")) observed();
+  });
+  const first = runner.run({ prompt: "approval:multi", cwd: fixturesDir, threadId: "thread-first", onApproval });
+  const firstInterrupted = assert.rejects(first, /interrupted/i);
+  const second = runner.run({ prompt: "approval:command", cwd: fixturesDir, threadId: "thread-second", onApproval });
+  void firstInterrupted.catch(() => undefined);
+  void second.catch(() => undefined);
+  await allObserved;
+
+  await runner.stop("thread-first");
+  await firstInterrupted;
+  assert.deepEqual(approvals.get("thread-first")?.map(({ signal }) => signal?.aborted), [true, true]);
+  assert.equal(approvals.get("thread-second")?.[0]?.signal?.aborted, false);
+  approvals.get("thread-second")?.[0]?.decide("accept");
+  assert.equal((await second).text, "approval:command:accept");
+});
+
+test("aborts a pending approval when the app-server runner closes", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000,
+    turnTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  let signal: AbortSignal | undefined;
+  let observed!: () => void;
+  const seen = new Promise<void>((resolve) => { observed = resolve; });
+  const running = runner.run({
+    prompt: "approval:command",
+    cwd: fixturesDir,
+    onApproval: (_request, requestSignal?: AbortSignal) => {
+      signal = requestSignal;
+      observed();
+      return new Promise<"accept">(() => undefined);
+    }
+  });
+  const closed = assert.rejects(running, /runner closed/i);
+  await seen;
+  runner.close();
+  await closed;
+  assert.equal(signal?.aborted, true);
+});
+
+test("inherits each project permission policy for new and resumed threads", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const first = await runner.run({ prompt: "project-a", cwd: "/tmp/project-permissions-a", model: "verify-project-a" });
+  const second = await runner.run({
+    prompt: "project-b",
+    cwd: "/tmp/project-permissions-b",
+    threadId: "thread-project-permissions-b"
+  });
+  assert.equal(first.text, "reply:project-a");
+  assert.equal(second.text, "reply:project-b");
+});
+
+test("propagates an explicit approval policy for new and resumed threads", async (t) => {
+  const runner = createConfiguredCodexRunner({
+    ...defaultConfig(fixturesDir),
+    codexBackend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    codexRequestTimeoutMs: 2_000,
+    codexApprovalPolicy: "on-request"
+  });
+  t.after(() => runner.close());
+
+  const first = await runner.run({
+    prompt: "approval:command",
+    cwd: "/tmp/project-explicit-policy-a",
+    onApproval: () => "accept"
+  });
+  const second = await runner.run({
+    prompt: "approval:command",
+    cwd: "/tmp/project-explicit-policy-b",
+    threadId: "thread-explicit-policy-b",
+    onApproval: () => "accept"
+  });
+  assert.equal(first.text, "approval:command:accept");
+  assert.equal(second.text, "approval:command:accept");
 });
 
 test("propagates the configured sandbox to an app-server turn", async (t) => {
@@ -199,7 +412,8 @@ test("runs AI classification on a persistent ephemeral app-server thread", async
     backend: "app-server",
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
     timeoutMs: 2_000,
-    execSandbox: "danger-full-access"
+    execSandbox: "danger-full-access",
+    approvalPolicy: "on-request"
   });
   t.after(() => runner.close());
 
@@ -367,7 +581,8 @@ test("reports an active app-server timeout without replaying the turn through ex
   const runner = new HybridCodexRunner({
     backend: "auto",
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
-    timeoutMs: 500
+    timeoutMs: 500,
+    turnTimeoutMs: 500
   });
   t.after(() => runner.close());
   let starts = 0;

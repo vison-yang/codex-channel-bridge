@@ -22,7 +22,7 @@ import type { ChannelAdapter, ChannelTextClient } from "../channels/types.js";
 import { createTaskCard, type ChannelTaskCard } from "../channels/task-card.js";
 import { WeComChannelAdapter } from "../channels/wecom.js";
 import type { CodexHistoryMessage, CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
-import { HybridCodexRunner } from "../codex/runner.js";
+import { createConfiguredCodexRunner, type HybridCodexRunner } from "../codex/runner.js";
 import {
   LlmWikiMcpClientPool,
   type LlmWikiInspection
@@ -268,11 +268,7 @@ export class AccountManager {
       ? new WeComChannelAdapter(account)
       : new FeishuChannelAdapter(account, adapterOptions));
     this.monitor = options.monitor ?? monitorWeixin;
-    this.runnerFactory = options.runnerFactory ?? ((config) => new HybridCodexRunner({
-      backend: config.codexBackend,
-      codexBin: config.codexBin,
-      execSandbox: config.codexExecSandbox
-    }));
+    this.runnerFactory = options.runnerFactory ?? createConfiguredCodexRunner;
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
     this.codexDesktopApprovalMonitorFactory = options.codexDesktopApprovalMonitorFactory
@@ -881,7 +877,7 @@ export class AccountManager {
         queueKey: session.threadId ?? session.id,
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
-        onApproval: (request: CodexApprovalRequest) => this.requestProjectApprovalForSession(accountId, session, request),
+        onApproval: (request, signal) => this.requestProjectApprovalForSession(accountId, session, request, signal),
         ...((session.streamReplies ?? config.streamReplies) && onProgress
           ? { onProgress }
           : {})
@@ -1087,18 +1083,20 @@ export class AccountManager {
   private requestProjectApprovalForSession(
     accountId: string,
     session: ManagedSession,
-    request: CodexApprovalRequest
+    request: CodexApprovalRequest,
+    signal?: AbortSignal
   ): Promise<CodexApprovalDecision> {
     const project = session.projectId
       ? this.storeFor(accountId).listProjects().find((candidate) => candidate.id === session.projectId)
       : undefined;
     if (!project) return Promise.resolve("decline");
-    return this.requestProjectApproval(project, request).then((decision) => decision ?? "decline");
+    return this.requestProjectApproval(project, request, signal).then((decision) => decision ?? "decline");
   }
 
   private async requestProjectApproval(
     project: ManagedProject,
-    request: CodexApprovalRequest
+    request: CodexApprovalRequest,
+    signal?: AbortSignal
   ): Promise<CodexApprovalDecision | undefined> {
     const target = (project.notifications ?? [])
       .filter((candidate) => candidate.enabled)
@@ -1111,7 +1109,7 @@ export class AccountManager {
       return undefined;
     }
     const entry = this.entries.get(target.accountId);
-    return entry?.service?.requestApproval(target.recipientId, request);
+    return entry?.service?.requestApproval(target.recipientId, request, signal);
   }
 
   private projectForExternalThread(threadId: string, workspace?: string): ManagedProject | undefined {

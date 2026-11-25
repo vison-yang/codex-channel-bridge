@@ -4,7 +4,8 @@ import path from "node:path";
 import readline from "node:readline";
 
 import { notifyCodexObserver, parseExecActivityLine, type CodexActivityEvent } from "./activity.js";
-import { CodexRunError, notifyExecutionStarted } from "./run-lifecycle.js";
+import type { CodexApprovalPolicy } from "./approval.js";
+import { DEFAULT_CODEX_TURN_TIMEOUT_MS, CodexRunError, notifyExecutionStarted } from "./run-lifecycle.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 
 export type BuildCodexExecArgsInput = {
@@ -13,6 +14,7 @@ export type BuildCodexExecArgsInput = {
   threadId?: string;
   queueKey?: string;
   sandbox?: CodexExecSandbox;
+  approvalPolicy?: CodexApprovalPolicy;
   model?: string;
   effort?: string;
   onExecutionStarted?: () => void;
@@ -23,6 +25,7 @@ export type BuildCodexExecArgsInput = {
 
 export function buildCodexExecArgs(input: BuildCodexExecArgsInput): string[] {
   const runtimeArgs = [
+    ...(input.approvalPolicy ? ["-c", `approval_policy=${JSON.stringify(input.approvalPolicy)}`] : []),
     ...(input.model ? ["--model", input.model] : []),
     ...(input.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(input.effort)}`] : [])
   ];
@@ -55,6 +58,7 @@ export function buildCodexExecArgs(input: BuildCodexExecArgsInput): string[] {
 export type CodexExecRunnerOptions = {
   codexBin?: string;
   sandbox?: CodexExecSandbox;
+  approvalPolicy?: CodexApprovalPolicy;
   timeoutMs?: number;
 };
 
@@ -79,10 +83,11 @@ export class CodexExecRunner {
 
   run(input: BuildCodexExecArgsInput): Promise<CodexRunResult> {
     const codexCommand = resolveCodexCommand(this.options.codexBin ?? "codex");
-    const timeoutMs = this.options.timeoutMs ?? 600_000;
+    const timeoutMs = this.options.timeoutMs ?? DEFAULT_CODEX_TURN_TIMEOUT_MS;
     const args = buildCodexExecArgs({
       ...input,
-      sandbox: this.options.sandbox ?? input.sandbox
+      sandbox: this.options.sandbox ?? input.sandbox,
+      approvalPolicy: this.options.approvalPolicy ?? input.approvalPolicy
     });
 
     return new Promise((resolve, reject) => {
@@ -109,13 +114,17 @@ export class CodexExecRunner {
         if (activity) notifyCodexObserver(input.onActivity, activity);
       });
       const timer = setTimeout(() => {
+        clearTimeout(timer);
         activityLines?.close();
         reject(new CodexRunError(`codex exec timed out after ${timeoutMs}ms`, "timed_out"));
         child.kill();
       }, timeoutMs);
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
-      child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout.push(chunk);
+        timer.refresh();
+      });
       child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
       child.on("error", (error) => {
         clearTimeout(timer);

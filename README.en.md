@@ -247,7 +247,22 @@ Only absolute local paths are accepted. Native outbound types are `image`, `vide
 
 The default `codexBackend` is `auto`. On the first Codex message, the service starts one persistent `codex app-server --stdio` process and uses the current `initialize`, `thread/*`, and `turn/*` protocol. New and resumed conversations prefer app-server; startup, handshake, or request failures automatically fall back to `codex exec` or `codex exec resume`.
 
-Chat-started app-server turns use `approvalPolicy: "on-request"`. Command, file-change, and additional-permission requests are routed back to the originating account and sender and wait for `/approve` or `/reject`; timeout, delivery failure, or a missing owning turn safely declines the request. Turns with channel approval enabled do not fall back to non-interactive `codex exec`. The management page can still pin the backend to `app-server` or `exec` for diagnostics.
+Codex resolves the effective project permissions, sandbox, and approval policy from the session's working directory. The management page inherits the Codex sandbox by default and supports an explicit sandbox override for the app-server and exec backends. When Codex requests approval, the bridge routes it to the originating account and sender and waits for `/approve` or `/reject`. It declines on timeout, delivery failure, or a missing owning turn. Turns that use channel approvals require app-server.
+
+Tasks default to a 24-hour inactivity timeout. Activity from the current turn resets the timer, and waiting for human approval pauses it. Each approval has its own response window.
+
+Set the following fields in the state directory's `config.json` and restart the bridge to apply changes. The state directory defaults to `~/.codex-weixin` and can be set with `CODEX_CHANNEL_BRIDGE_STATE_DIR`.
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `codexExecSandbox` | `"inherit"` | Use the project's sandbox. Explicit options are `"read-only"`, `"workspace-write"`, and `"danger-full-access"`. |
+| `codexApprovalPolicy` | `"inherit"` | Use the project's approval policy. Explicit options are `"untrusted"`, `"on-request"`, and `"never"`. |
+| `codexTurnTimeoutMs` | `86400000` | Turn inactivity timeout, default 24 hours. |
+| `codexApprovalTimeoutMs` | `600000` | Response window per approval, default 10 minutes. |
+| `codexRequestTimeoutMs` | `600000` | App Server request, session availability, and intent classification timeout. Initialization waits up to 60 seconds. |
+| `codexUserInputTimeoutMs` | `300000` | Response window per interactive question when Codex supplies no deadline, default five minutes. |
+
+Timeout values are integers in milliseconds from `1` to `2147483647`. Omitting the sandbox and approval policy also inherits the Codex settings for the task's working directory.
 
 ## Models and reasoning effort
 

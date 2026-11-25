@@ -88,6 +88,13 @@ test("passes model and reasoning effort to new and resumed exec turns", () => {
   );
 });
 
+test("passes an explicit approval policy through exec config overrides", () => {
+  assert.deepEqual(
+    buildCodexExecArgs({ prompt: "hello", cwd: "/tmp/project", approvalPolicy: "on-request" }),
+    ["exec", "--skip-git-repo-check", "-c", 'approval_policy="on-request"', "--json", "hello"]
+  );
+});
+
 test("explains how to recover from the Windows background sandbox error", () => {
   const error = formatCodexExecFailure(
     1,

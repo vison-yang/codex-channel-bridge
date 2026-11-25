@@ -124,30 +124,35 @@ rl.on("line", (line) => {
   if (!message.method && pendingApprovals.has(message.id)) {
     const approval = pendingApprovals.get(message.id);
     pendingApprovals.delete(message.id);
+    if (approval.waitForAll && Array.from(pendingApprovals.values()).some((pending) => pending.turnId === approval.turnId)) return;
     const decision = approval.kind === "permissions"
       ? (Object.keys(message.result?.permissions ?? {}).length ? "accept" : "decline")
       : message.result?.decision;
-    const itemId = `item-${approval.turnId}`;
-    send({
-      method: "item/completed",
-      params: {
-        threadId: approval.threadId,
-        turnId: approval.turnId,
-        completedAtMs: Date.now(),
-        item: {
-          type: "agentMessage",
-          id: itemId,
-          text: `approval:${approval.kind}:${decision}`,
-          phase: "final_answer",
-          memoryCitation: null
+    const finish = () => {
+      const itemId = `item-${approval.turnId}`;
+      send({
+        method: "item/completed",
+        params: {
+          threadId: approval.threadId,
+          turnId: approval.turnId,
+          completedAtMs: Date.now(),
+          item: {
+            type: "agentMessage",
+            id: itemId,
+            text: `approval:${approval.kind}:${decision}`,
+            phase: "final_answer",
+            memoryCitation: null
+          }
         }
-      }
-    });
-    send({
-      method: "turn/completed",
-      params: { threadId: approval.threadId, turn: completedTurn(approval.turnId, "completed") }
-    });
-    activeTurns.delete(approval.threadId);
+      });
+      send({
+        method: "turn/completed",
+        params: { threadId: approval.threadId, turn: completedTurn(approval.turnId, "completed") }
+      });
+      activeTurns.delete(approval.threadId);
+    };
+    if (approval.delayedCompletion) setTimeout(finish, 350);
+    else finish();
     return;
   }
 
@@ -172,11 +177,22 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/start") {
-    if (message.params?.approvalPolicy !== "never") {
-      fail(message.id, "approvalPolicy must be never");
+    const isEphemeral = message.params?.ephemeral === true;
+    const configuredPolicy = message.params?.cwd === "/tmp/project-explicit-policy-a";
+    if ((isEphemeral && (message.params?.approvalPolicy !== "never" || message.params?.sandbox !== "read-only"))
+      || (!isEphemeral && (configuredPolicy
+        ? message.params?.approvalPolicy !== "on-request"
+        : Object.hasOwn(message.params, "approvalPolicy")))
+      || (!isEphemeral && Object.hasOwn(message.params, "sandbox"))
+      || Object.hasOwn(message.params, "sandboxPolicy")) {
+      fail(message.id, "thread/start must preserve configured or project permissions");
       return;
     }
-    ephemeralThreadStarted = message.params?.ephemeral === true;
+    if (message.params?.model === "verify-project-a" && message.params?.cwd !== "/tmp/project-permissions-a") {
+      fail(message.id, "thread/start must use the first project cwd");
+      return;
+    }
+    ephemeralThreadStarted = isEphemeral;
     dynamicToolsEnabled = message.params?.dynamicTools?.[0]?.name === "knowledge";
     respond(message.id, {
       thread: { id: "thread-new" },
@@ -187,6 +203,21 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/resume") {
+    const configuredPolicy = message.params?.threadId === "thread-explicit-policy-b";
+    if ((configuredPolicy ? message.params?.approvalPolicy !== "on-request" : Object.hasOwn(message.params, "approvalPolicy"))
+      || Object.hasOwn(message.params, "sandbox")
+      || Object.hasOwn(message.params, "sandboxPolicy")) {
+      fail(message.id, "thread/resume must preserve configured or project permissions");
+      return;
+    }
+    if (configuredPolicy && message.params?.cwd !== "/tmp/project-explicit-policy-b") {
+      fail(message.id, "thread/resume must use the explicit-policy project cwd");
+      return;
+    }
+    if (message.params?.threadId === "thread-project-permissions-b" && message.params?.cwd !== "/tmp/project-permissions-b") {
+      fail(message.id, "thread/resume must use the second project cwd");
+      return;
+    }
     respond(message.id, {
       thread: { id: message.params.threadId },
       model: "resumed-model",
@@ -331,10 +362,21 @@ rl.on("line", (line) => {
       fail(message.id, "turn/start requires text input");
       return;
     }
-    const approvalKind = prompt.startsWith("approval:") ? prompt.slice("approval:".length) : undefined;
-    const expectedApprovalPolicy = approvalKind ? "on-request" : "never";
-    if (message.params?.approvalPolicy !== expectedApprovalPolicy) {
-      fail(message.id, `turn approvalPolicy must be ${expectedApprovalPolicy}`);
+    const approvalMode = prompt.startsWith("approval:") ? prompt.slice("approval:".length) : undefined;
+    const approvalKind = ["early", "late", "multi"].includes(approvalMode) ? "command" : approvalMode;
+    if ((prompt === "project-a" && message.params?.cwd !== "/tmp/project-permissions-a")
+      || (prompt === "project-b" && message.params?.cwd !== "/tmp/project-permissions-b")) {
+      fail(message.id, "turn/start must use the originating project cwd");
+      return;
+    }
+    const isEphemeral = prompt === "classify-intent";
+    const configuredPolicy = ["/tmp/project-explicit-policy-a", "/tmp/project-explicit-policy-b"].includes(message.params?.cwd);
+    if ((isEphemeral && message.params?.approvalPolicy !== "never")
+      || (!isEphemeral && (configuredPolicy
+        ? message.params?.approvalPolicy !== "on-request"
+        : Object.hasOwn(message.params, "approvalPolicy")))
+      || Object.hasOwn(message.params, "sandbox")) {
+      fail(message.id, "turn/start must preserve configured or project approval permissions");
       return;
     }
     if (prompt === "verify-danger-full-access"
@@ -347,6 +389,10 @@ rl.on("line", (line) => {
         || message.params?.sandboxPolicy?.type !== "readOnly"
         || message.params?.outputSchema?.properties?.intent?.type !== "string")) {
       fail(message.id, "intent classification must use an ephemeral read-only thread with output schema");
+      return;
+    }
+    if (!isEphemeral && prompt !== "verify-danger-full-access" && Object.hasOwn(message.params, "sandboxPolicy")) {
+      fail(message.id, "ordinary turn/start must inherit the project sandbox");
       return;
     }
     if (prompt === "plan-mode") {
@@ -365,34 +411,63 @@ rl.on("line", (line) => {
       activeTurns.delete(message.params.threadId);
       return;
     }
-    respond(message.id, { turn: completedTurn(turnId, "inProgress") });
     if (["command", "file", "permissions"].includes(approvalKind)) {
-      const approvalId = `approval-${turnId}`;
-      pendingApprovals.set(approvalId, {
-        kind: approvalKind,
-        threadId: message.params.threadId,
-        turnId
-      });
       const method = approvalKind === "command"
         ? "item/commandExecution/requestApproval"
         : approvalKind === "file"
           ? "item/fileChange/requestApproval"
           : "item/permissions/requestApproval";
-      send({
-        id: approvalId,
-        method,
-        params: {
+      const sendApproval = (index) => {
+        const approvalId = `approval-${turnId}-${index}`;
+        pendingApprovals.set(approvalId, {
+          kind: approvalKind,
           threadId: message.params.threadId,
           turnId,
-          itemId: `approval-item-${turnId}`,
-          startedAtMs: Date.now(),
-          cwd: "/tmp/project",
-          command: approvalKind === "command" ? "touch approved.txt" : null,
-          reason: `fixture ${approvalKind} approval`,
-          grantRoot: approvalKind === "file" ? "/tmp/project" : null,
-          permissions: approvalKind === "permissions" ? { network: { enabled: true } } : undefined
+          delayedCompletion: approvalMode === "early" || approvalMode === "late",
+          waitForAll: approvalMode === "multi"
+        });
+        send({
+          id: approvalId,
+          method,
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            itemId: `approval-item-${turnId}-${index}`,
+            startedAtMs: Date.now(),
+            cwd: "/tmp/project",
+            command: approvalKind === "command" ? "touch approved.txt" : null,
+            reason: `fixture ${approvalKind} approval`,
+            grantRoot: approvalKind === "file" ? "/tmp/project" : null,
+            permissions: approvalKind === "permissions" ? { network: { enabled: true } } : undefined
+          }
+        });
+      };
+      if (approvalMode === "early") sendApproval(1);
+      respond(message.id, { turn: completedTurn(turnId, "inProgress") });
+      if (approvalMode !== "early") sendApproval(1);
+      if (approvalMode === "multi") sendApproval(2);
+      return;
+    }
+    respond(message.id, { turn: completedTurn(turnId, "inProgress") });
+    if (prompt === "activity-timeout" || prompt === "foreign-activity-timeout") {
+      const observedTurn = prompt === "activity-timeout" ? turnId : "unrelated-turn";
+      const sendActivity = () => send({
+        method: "item/started",
+        params: {
+          threadId: message.params.threadId,
+          turnId: observedTurn,
+          item: { id: "activity-1", type: "commandExecution", status: "inProgress" }
         }
       });
+      if (prompt === "activity-timeout") {
+        setTimeout(sendActivity, 350);
+        setTimeout(() => {
+          send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: completedTurn(turnId, "completed") } });
+          activeTurns.delete(message.params.threadId);
+        }, 700);
+      } else {
+        for (let delay = 200; delay <= 1_400; delay += 200) setTimeout(sendActivity, delay);
+      }
       return;
     }
     if (prompt === "hold") {

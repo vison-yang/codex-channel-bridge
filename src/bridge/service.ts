@@ -47,7 +47,7 @@ import type {
   CodexThreadGoalStatus
 } from "../codex/app-server-runner.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
-import { HybridCodexRunner } from "../codex/runner.js";
+import { createConfiguredCodexRunner, type HybridCodexRunner } from "../codex/runner.js";
 import { codexFailureOutcome } from "../codex/run-lifecycle.js";
 import {
   LlmWikiMcpClientPool,
@@ -150,17 +150,14 @@ export class BridgeService {
       (senderId, notice) => notice.card
         ? this.replyActionCard(senderId, notice.card)
         : this.reply(senderId, notice.text),
-      options.approvalTimeoutMs
+      options.approvalTimeoutMs ?? options.config.codexApprovalTimeoutMs
     );
-    this.runner = options.runner ?? new HybridCodexRunner({
-      backend: options.config.codexBackend,
-      codexBin: options.config.codexBin,
-      execSandbox: options.config.codexExecSandbox
-    });
+    this.runner = options.runner ?? createConfiguredCodexRunner(options.config);
     this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
     this.modeSettings = normalizeChannelModeSettings(options.modeSettings);
     this.userInputs = new ChannelUserInputController(
-      (senderId, card) => this.replyActionCard(senderId, card)
+      (senderId, card) => this.replyActionCard(senderId, card),
+      options.config.codexUserInputTimeoutMs
     );
     this.taskboardController = new TaskboardChannelController({
       client: options.taskboard,
@@ -1510,7 +1507,7 @@ export class BridgeService {
               await this.reply(message.senderId, `【进度】${progressText}`);
             }
           } : {}),
-          onApproval: (request: CodexApprovalRequest) => this.approvals.request(message.senderId, request),
+          onApproval: (request, signal) => this.approvals.request(message.senderId, request, signal),
           onUserInput: (request) => this.userInputs.request(message.senderId, request)
         });
         console.log(`[codex-channel-bridge] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
@@ -1887,8 +1884,8 @@ export class BridgeService {
     return this.access.listPairedSenderIds();
   }
 
-  requestApproval(senderId: string, request: CodexApprovalRequest): Promise<CodexApprovalDecision> {
-    return this.approvals.request(senderId, request);
+  requestApproval(senderId: string, request: CodexApprovalRequest, signal?: AbortSignal): Promise<CodexApprovalDecision> {
+    return this.approvals.request(senderId, request, signal);
   }
 }
 
