@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type * as Lark from "@larksuiteoapi/node-sdk";
 
 import type { FeishuTaskCardPayload } from "./feishu-task-card.js";
+import { checkFeishuResponse } from "./feishu-feedback-api.js";
 
 type FeishuCardPayload = Lark.InteractiveCard | FeishuTaskCardPayload;
 type FeishuMessagePatch = Lark.Client["im"]["v1"]["message"]["patch"];
@@ -36,10 +37,11 @@ export class FeishuCardUpdater {
       return;
     }
     if (!this.patch) throw new FeishuCardUpdateUnavailableError();
-    await this.patch({
+    const result = await this.patch({
       path: { message_id: messageId },
       data: { content: JSON.stringify(card) }
     });
+    if (result) checkFeishuResponse("update card", result);
   }
 }
 

@@ -1,6 +1,21 @@
 import type { NormalizedWeixinMessage } from "../weixin/messages.js";
+import type { CodexActivityEvent } from "../codex/activity.js";
 import type { ChannelActionCard } from "./action-card.js";
 import type { ChannelTaskCard } from "./task-card.js";
+
+export type ChannelTaskOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+
+export type ChannelStreamReply = {
+  delta(text: string): void;
+  finish(text?: string): Promise<string | undefined>;
+};
+
+export type ChannelMessageFeedback = {
+  start(showProgress?: boolean): void;
+  activity?: (event: CodexActivityEvent) => void;
+  stream?: ChannelStreamReply;
+  recordOutcome(outcome: ChannelTaskOutcome): void;
+};
 
 export type ChannelTextClient = {
   sendText(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
@@ -15,6 +30,7 @@ export type ChannelTextClient = {
 export type ChannelMonitorOptions = {
   signal?: AbortSignal;
   claimMessage?: (message: NormalizedWeixinMessage) => boolean;
+  isMessageAllowed?: (message: NormalizedWeixinMessage) => boolean;
   onMessage: (message: NormalizedWeixinMessage) => Promise<void>;
   onMessageError?: (error: unknown, message: NormalizedWeixinMessage) => Promise<void> | void;
 };

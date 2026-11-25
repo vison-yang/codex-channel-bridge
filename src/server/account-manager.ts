@@ -207,7 +207,12 @@ export type AccountManagerOptions = {
   paths: StatePaths;
   configProvider?: () => CodexWeixinConfig;
   clientFactory?: (account: WeixinAccount) => WeixinApiClient;
-  channelFactory?: (account: WeComAccount | FeishuAccount, options: { inboundDir: string }) => ChannelAdapter;
+  channelFactory?: (account: WeComAccount | FeishuAccount, options: {
+    inboundDir: string;
+    feishuReactions: boolean;
+    feishuProgressCards: boolean;
+    feishuStreamingReplies: boolean;
+  }) => ChannelAdapter;
   bridgeFactory?: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   monitor?: (options: MonitorOptions) => Promise<void>;
   runnerFactory?: (config: CodexWeixinConfig) => HybridCodexRunner;
@@ -261,7 +266,7 @@ export class AccountManager {
     this.bridgeFactory = options.bridgeFactory ?? ((input) => new BridgeService(input));
     this.channelFactory = options.channelFactory ?? ((account, adapterOptions) => account.channel === "wecom"
       ? new WeComChannelAdapter(account)
-      : new FeishuChannelAdapter(account, { inboundDir: adapterOptions.inboundDir }));
+      : new FeishuChannelAdapter(account, adapterOptions));
     this.monitor = options.monitor ?? monitorWeixin;
     this.runnerFactory = options.runnerFactory ?? ((config) => new HybridCodexRunner({
       backend: config.codexBackend,
@@ -351,12 +356,17 @@ export class AccountManager {
       ...(account.webhookUrl ? { webhookUrl: account.webhookUrl } : {}),
       ...(account.webhookProvider ? { webhookProvider: account.webhookProvider } : {})
     });
+    const config = this.configProvider();
     const adapter = channel === "weixin" ? undefined : this.channelFactory(
       account as WeComAccount | FeishuAccount,
-      { inboundDir: statePaths.inboundDir }
+      {
+        inboundDir: statePaths.inboundDir,
+        feishuReactions: config.feishuReactions,
+        feishuProgressCards: config.feishuProgressCards,
+        feishuStreamingReplies: config.feishuStreamingReplies
+      }
     );
     const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
-    const config = this.configProvider();
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
       config,
@@ -424,6 +434,7 @@ export class AccountManager {
     const task = adapter ? adapter.monitor({
       signal: controller.signal,
       claimMessage: (message) => store.claimProcessedMessage(message.id),
+      isMessageAllowed: (message) => service.isMessageAllowed(message),
       onMessage: handleMessage,
       onMessageError
     }) : this.monitor({

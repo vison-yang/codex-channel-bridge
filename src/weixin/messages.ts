@@ -1,3 +1,5 @@
+import type { ChannelMessageFeedback } from "../channels/types.js";
+
 export type WeixinRawMessage = {
   [key: string]: unknown;
   message_id?: string | number;
@@ -23,6 +25,7 @@ export type NormalizedWeixinMessage = {
   replyTargetId?: string;
   /** A channel-native interaction that does not include its conversation id. */
   source?: "native-menu";
+  feedback?: ChannelMessageFeedback;
   contextToken?: string;
   interaction?: {
     readonly kind: "card";

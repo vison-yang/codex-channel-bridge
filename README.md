@@ -58,6 +58,20 @@
 
 一个服务可以并行运行多个个人微信、企业微信和飞书渠道。每个账号拥有独立的联系人授权、附件、会话、个人知识库和运行状态；移除个人微信账号时还可以选择保留历史，重新扫码后继续使用。
 
+#### 飞书任务反馈
+
+在服务状态目录的 `config.json` 中可独立设置以下选项。默认状态目录是 `~/.codex-weixin`，也可通过 `CODEX_CHANNEL_BRIDGE_STATE_DIR` 指定。
+
+| 配置项 | 默认值 | 行为 |
+| --- | --- | --- |
+| `feishuReactions` | `true` | 授权并去重后立即向原消息添加 `Get`。Codex 开始执行时添加 `Typing`，已发送最终回复时改为 `DONE`，失败、取消和超时分别显示 `ERROR`、`CrossMark`、`Alarm`。 |
+| `feishuProgressCards` | `true` | 执行达到 10 秒时回复一张进度卡片。单卡写入至少间隔 5 秒，终态会保留在卡片内。可用 `/stream off` 关闭当前会话的进度卡片。 |
+| `feishuStreamingReplies` | `false` | 对 App Server 明确标记为 `final_answer` 的增量文本启用 CardKit 流式回复。没有可用增量、卡片发送失败或最终内容超出卡片上限时，仍可收到原有文本回复。 |
+
+在现有飞书应用上启用对应权限并发布应用版本。表情使用 `im:message.reactions:write_only`，普通卡片更新可使用 `im:message:update` 或现有的等效权限。开启 CardKit 流式回复需 `cardkit:card:write`，并按飞书流式更新指南核对 `im:message:send_as_bot` 和 `im:message`。进度和流式卡片都沿用原消息的会话。 [飞书表情文案](https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce) · [消息接口权限](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1) · [CardKit 流式更新](https://open.feishu.cn/document/cardkit-v1/streaming-updates-openapi-overview)
+
+服务日志中的 `Feishu Get acknowledged in …ms` 计量 Bridge 收到长连接事件到飞书 API 返回成功的耗时。调整配置后，在会话和 Taskboard 空闲时重启 Bridge 服务使配置生效。
+
 管理页的“添加渠道”同时支持个人微信扫码、企业微信智能机器人和飞书企业自建应用。企业微信与飞书使用官方长连接 SDK，不需要为本机服务配置公网回调地址。每个 Codex 项目都可以开启“任务结束通知”，选择任一已添加渠道和接收会话（或用户）ID；该项目下从聊天端或 Web 发起的任务，无论成功还是失败，结束后都会发送项目、任务和结果摘要。
 
 聊天端任务需要运行命令、修改文件或申请额外权限时，审批请求会发回发起任务的同一账号和联系人。回复 `/approve A1`（短写 `/ok A1`）批准一次，或 `/reject A1`（短写 `/no A1`）拒绝；10 分钟未回复会自动拒绝。审批编号按账号和联系人隔离，其他渠道或联系人不能代为处理。

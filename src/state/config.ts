@@ -18,6 +18,9 @@ export type CodexWeixinConfig = {
   model?: string;
   effort?: string;
   streamReplies: boolean;
+  feishuReactions: boolean;
+  feishuProgressCards: boolean;
+  feishuStreamingReplies: boolean;
   maxBufferItems: number;
   promptBufferTtlMs: number;
   maxInboundBytes: number;
@@ -33,6 +36,9 @@ export function defaultConfig(cwd = path.join(os.homedir(), ".codex-weixin")): C
     codexBin: "codex",
     codexBackend: "auto",
     streamReplies: true,
+    feishuReactions: true,
+    feishuProgressCards: true,
+    feishuStreamingReplies: false,
     maxBufferItems: 50,
     promptBufferTtlMs: 10 * 60_000,
     maxInboundBytes: MAX_INBOUND_BYTES,
@@ -50,6 +56,9 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexWeixinConfig {
     ...loaded,
     codexExecSandbox,
     streamReplies: typeof loaded.streamReplies === "boolean" ? loaded.streamReplies : base.streamReplies,
+    feishuReactions: typeof loaded.feishuReactions === "boolean" ? loaded.feishuReactions : base.feishuReactions,
+    feishuProgressCards: typeof loaded.feishuProgressCards === "boolean" ? loaded.feishuProgressCards : base.feishuProgressCards,
+    feishuStreamingReplies: typeof loaded.feishuStreamingReplies === "boolean" ? loaded.feishuStreamingReplies : base.feishuStreamingReplies,
     taskboardEnabled: typeof loaded.taskboardEnabled === "boolean" ? loaded.taskboardEnabled : base.taskboardEnabled,
     taskboardUrl: typeof loaded.taskboardUrl === "string" && loaded.taskboardUrl.trim()
       ? loaded.taskboardUrl.trim()

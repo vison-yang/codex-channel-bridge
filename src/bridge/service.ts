@@ -48,6 +48,7 @@ import type {
 } from "../codex/app-server-runner.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { HybridCodexRunner } from "../codex/runner.js";
+import { codexFailureOutcome } from "../codex/run-lifecycle.js";
 import {
   LlmWikiMcpClientPool,
   llmWikiDynamicTools
@@ -185,6 +186,10 @@ export class BridgeService {
 
   async handleMessage(message: NormalizedWeixinMessage): Promise<void> {
     return this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message));
+  }
+
+  isMessageAllowed(message: NormalizedWeixinMessage): boolean {
+    return this.access.requireAccess(message.senderId, message.replyTargetId).allowed;
   }
 
   private async handleInboundMessage(message: NormalizedWeixinMessage): Promise<void> {
@@ -342,7 +347,7 @@ export class BridgeService {
       case "status":
       case "where":
         {
-          const status = await this.statusText(message.senderId);
+          const status = await this.statusText(message.senderId, message.raw.channel === "feishu");
           await this.replyActionCard(message.senderId, createChoiceCard({
             title: "当前工作上下文",
             body: status.replace(/^当前工作上下文\n/, ""),
@@ -423,7 +428,7 @@ export class BridgeService {
         await this.handleEffortCommand(message.senderId, command.arg);
         return;
       case "stream":
-        await this.handleStreamCommand(message.senderId, command.arg);
+        await this.handleStreamCommand(message.senderId, command.arg, message.raw.channel === "feishu");
         return;
       case "prompt":
         await this.handlePromptCommand(message.senderId, command.arg);
@@ -434,12 +439,14 @@ export class BridgeService {
       case "reject":
         await this.reply(message.senderId, this.approvals.decide(message.senderId, command.arg, "decline"));
         return;
-      case "stop":
+      case "stop": {
         this.approvals.declineAll(message.senderId);
         this.userInputs.cancelSender(message.senderId);
-        await this.runner.stop(this.executionSession(message.senderId)?.threadId);
+        const session = this.executionSession(message.senderId);
+        if (session) await this.runner.stop(session.threadId || undefined, session.threadId || session.id);
         await this.reply(message.senderId, "Stop signal sent.");
         return;
+      }
       default:
         await this.replyActionCard(message.senderId, createMainMenuCard(
           `未知命令：/${command.name}。发送 /help 查看可用命令。`
@@ -1221,13 +1228,13 @@ export class BridgeService {
     await this.reply(senderId, `本会话推理强度已切换为：${formatEffort(effort)}\n下一条消息开始生效。`);
   }
 
-  private async handleStreamCommand(senderId: string, arg: string): Promise<void> {
+  private async handleStreamCommand(senderId: string, arg: string, isFeishu: boolean): Promise<void> {
     const input = arg.trim().toLowerCase();
     const session = this.executionSession(senderId);
-    const inherited = this.options.config.streamReplies;
+    const inherited = isFeishu ? this.options.config.feishuProgressCards : this.options.config.streamReplies;
     if (!input) {
-      const effective = session?.streamReplies ?? inherited;
-      const source = typeof session?.streamReplies === "boolean" ? "本会话设置" : "继承全局";
+      const effective = this.isProgressEnabled(session?.streamReplies, isFeishu);
+      const source = isFeishu && !inherited ? "全局已关闭" : typeof session?.streamReplies === "boolean" ? "本会话设置" : "继承全局";
       const fallbackText = `当前过程进度：${effective ? "开启" : "关闭"}（${source}）\n发送 /stream on、/stream off 或 /stream default 切换。`;
       await this.replyActionCard(senderId, createCommandSelectionCard({
         title: "过程进度",
@@ -1261,7 +1268,15 @@ export class BridgeService {
     }
     const enabled = input === "on";
     this.updateExecutionRuntime(senderId, { streamReplies: enabled });
-    await this.reply(senderId, `本会话过程进度已${enabled ? "开启" : "关闭"}。`);
+    await this.reply(senderId, isFeishu && enabled && !inherited
+      ? "已保存本会话设置。飞书进度卡片全局关闭。"
+      : `本会话过程进度已${enabled ? "开启" : "关闭"}。`);
+  }
+
+  private isProgressEnabled(sessionOverride: boolean | undefined, isFeishu: boolean): boolean {
+    return isFeishu
+      ? this.options.config.feishuProgressCards && sessionOverride !== false
+      : sessionOverride ?? this.options.config.streamReplies;
   }
 
   private async handleMemoryCommand(senderId: string, arg: string): Promise<void> {
@@ -1460,7 +1475,10 @@ export class BridgeService {
     }
     const workspace = session.workspace;
     const threadId = session.threadId || undefined;
-    const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
+    const isFeishu = message.raw.channel === "feishu";
+    const progressEnabled = this.isProgressEnabled(session.streamReplies, isFeishu);
+    const feedback = message.feedback;
+    const stream = feedback?.stream;
     const sentProgress = new Set<string>();
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
     try {
@@ -1473,6 +1491,9 @@ export class BridgeService {
           cwd: workspace,
           threadId,
           queueKey: threadId ?? session.id,
+          onExecutionStarted: feedback ? () => feedback.start(progressEnabled) : undefined,
+          onActivity: progressEnabled ? feedback?.activity : undefined,
+          onFinalAnswerDelta: stream ? (delta) => stream.delta(delta) : undefined,
           model: session.model ?? this.options.config.model,
           effort: session.effort ?? this.options.config.effort,
           collaborationMode: session.collaborationMode === "plan" ? "plan" : undefined,
@@ -1480,7 +1501,7 @@ export class BridgeService {
             dynamicTools: llmWikiDynamicTools(),
             onDynamicToolCall: (call: CodexDynamicToolCall) => this.handleKnowledgeToolCall(qaContext, call)
           } : {}),
-          ...(progressEnabled ? {
+          ...(!isFeishu && progressEnabled ? {
             onProgress: async (progress: string) => {
               const progressText = progress.trim();
               if (!progressText || sentProgress.has(progressText)) return;
@@ -1499,15 +1520,26 @@ export class BridgeService {
         for (const memory of parsed.actions.remember) {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
         }
-        const remaining = chunkText(parsed.visibleText);
-        if (remaining.length) {
-          for (const chunk of remaining) {
+        const chunks = chunkText(parsed.visibleText);
+        const streamedMessageId = await stream?.finish(parsed.visibleText);
+        if (streamedMessageId) {
+          this.options.onOutboundMessage?.({
+            direction: "outbound",
+            id: streamedMessageId,
+            recipientId: message.senderId,
+            text: parsed.visibleText,
+            attachments: []
+          });
+        } else {
+          for (const chunk of chunks) {
             await this.reply(message.senderId, chunk);
           }
         }
+        let replyDelivered = chunks.length > 0 || parsed.actions.send.length > 0;
         for (const action of parsed.actions.send) {
-          await this.sendLocalMedia(message.senderId, action);
+          if (!await this.sendLocalMedia(message.senderId, action)) replyDelivered = false;
         }
+        feedback?.recordOutcome(replyDelivered ? "succeeded" : "failed");
         await this.options.onTurnCompleted?.({
           senderId: message.senderId,
           sessionId: session.id,
@@ -1517,6 +1549,7 @@ export class BridgeService {
         });
       });
     } catch (error) {
+      feedback?.recordOutcome(codexFailureOutcome(error));
       await this.options.onTurnCompleted?.({
         senderId: message.senderId,
         sessionId: session.id,
@@ -1596,7 +1629,7 @@ export class BridgeService {
     );
   }
 
-  private async sendLocalMedia(senderId: string, action: { type: "image" | "file" | "video"; path: string }): Promise<void> {
+  private async sendLocalMedia(senderId: string, action: { type: "image" | "file" | "video"; path: string }): Promise<boolean> {
     try {
       let sent: { messageId: string; kind: "image" | "file" | "video" };
       if (action.type === "image" && this.options.weixin.sendImage) {
@@ -1615,7 +1648,7 @@ export class BridgeService {
         });
       } else {
         await this.reply(senderId, `当前渠道暂不支持直接发送 ${action.type} 文件：${path.basename(action.path)}`);
-        return;
+        return false;
       }
       this.options.onOutboundMessage?.({
         direction: "outbound",
@@ -1624,8 +1657,10 @@ export class BridgeService {
         text: "",
         attachments: [{ kind: sent.kind, label: path.basename(action.path) }]
       });
+      return true;
     } catch (error) {
       await this.reply(senderId, `[codex-channel-bridge] Failed to send ${action.type}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
   }
 
@@ -1660,7 +1695,7 @@ export class BridgeService {
     }
   }
 
-  private async statusText(senderId: string): Promise<string> {
+  private async statusText(senderId: string, isFeishu: boolean): Promise<string> {
     const mode = this.options.stateStore.getInteractionMode(senderId);
     const project = this.options.stateStore.getActiveProject(senderId);
     const session = this.executionSession(senderId);
@@ -1692,7 +1727,7 @@ export class BridgeService {
       `exec sandbox：${this.options.config.codexExecSandbox ?? "Codex 默认"}`,
       `model: ${runtime.model ?? "(Codex default)"}`,
       `effort: ${runtime.effort ?? "(Codex default)"}`,
-      `过程回复：${(session?.streamReplies ?? this.options.config.streamReplies) ? "开启" : "关闭"}${typeof session?.streamReplies === "boolean" ? "（当前会话）" : "（全局）"}`
+      `过程回复：${this.isProgressEnabled(session?.streamReplies, isFeishu) ? "开启" : "关闭"}${typeof session?.streamReplies === "boolean" ? "（当前会话）" : "（全局）"}`
     ].join("\n");
   }
 

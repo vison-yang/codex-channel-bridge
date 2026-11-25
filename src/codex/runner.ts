@@ -8,6 +8,7 @@ import {
   type CodexThreadGoalStatus
 } from "./app-server-runner.js";
 import { CodexExecRunner, type CodexRunResult } from "./exec-runner.js";
+import { codexFailureOutcome } from "./run-lifecycle.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import type { CodexAccountBalance } from "./account-balance.js";
 
@@ -76,14 +77,22 @@ export class HybridCodexRunner {
     if (this.options.backend === "exec" && !requiresAppServerForStreaming) {
       return this.exec.run(input);
     }
+    let hasStarted = false;
     try {
-      return await this.appServer.run(input);
+      return await this.appServer.run({
+        ...input,
+        onExecutionStarted: () => {
+          hasStarted = true;
+          input.onExecutionStarted?.();
+        }
+      });
     } catch (error) {
-      if (this.options.backend === "app-server" || input.onApproval) {
+      if (this.options.backend === "app-server" || input.onApproval || codexFailureOutcome(error) !== "failed") {
         throw error;
       }
       const fallback = await this.exec.run({
         ...input,
+        onExecutionStarted: hasStarted ? undefined : input.onExecutionStarted,
         onDelta: undefined,
         onProgress: undefined
       });
@@ -94,10 +103,10 @@ export class HybridCodexRunner {
     }
   }
 
-  async stop(threadId?: string): Promise<void> {
+  async stop(threadId?: string, queueKey?: string): Promise<void> {
     await Promise.all([
-      this.appServer.stop(threadId),
-      this.exec.stop(threadId)
+      this.appServer.stop(threadId, queueKey),
+      this.exec.stop(threadId, queueKey)
     ]);
   }
 

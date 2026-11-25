@@ -1,16 +1,22 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import readline from "node:readline";
 
+import { notifyCodexObserver, parseExecActivityLine, type CodexActivityEvent } from "./activity.js";
+import { CodexRunError, notifyExecutionStarted } from "./run-lifecycle.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 
 export type BuildCodexExecArgsInput = {
   prompt: string;
   cwd: string;
   threadId?: string;
+  queueKey?: string;
   sandbox?: CodexExecSandbox;
   model?: string;
   effort?: string;
+  onExecutionStarted?: () => void;
+  onActivity?: (event: CodexActivityEvent) => void;
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
 };
@@ -59,8 +65,15 @@ export type CodexRunResult = {
   raw: string;
 };
 
+type ActiveExecRun = {
+  child: ChildProcess;
+  threadId?: string;
+  queueKey?: string;
+  isCancelled: boolean;
+};
+
 export class CodexExecRunner {
-  private readonly activeRuns: Array<{ child: ChildProcess; threadId?: string }> = [];
+  private readonly activeRuns: ActiveExecRun[] = [];
 
   constructor(private readonly options: CodexExecRunnerOptions = {}) {}
 
@@ -79,17 +92,26 @@ export class CodexExecRunner {
         shell: false,
         windowsHide: true
       });
-      const activeRun = { child, threadId: input.threadId };
+      const activeRun: ActiveExecRun = { child, threadId: input.threadId, queueKey: input.queueKey, isCancelled: false };
       this.activeRuns.push(activeRun);
+      child.once("spawn", () => notifyExecutionStarted(input.onExecutionStarted));
       const removeActiveRun = () => {
         const index = this.activeRuns.indexOf(activeRun);
         if (index >= 0) {
           this.activeRuns.splice(index, 1);
         }
       };
+      const activityLines = input.onActivity
+        ? readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+        : undefined;
+      activityLines?.on("line", (line) => {
+        const activity = parseExecActivityLine(line);
+        if (activity) notifyCodexObserver(input.onActivity, activity);
+      });
       const timer = setTimeout(() => {
+        activityLines?.close();
+        reject(new CodexRunError(`codex exec timed out after ${timeoutMs}ms`, "timed_out"));
         child.kill();
-        reject(new Error(`codex exec timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
@@ -97,16 +119,19 @@ export class CodexExecRunner {
       child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
       child.on("error", (error) => {
         clearTimeout(timer);
+        activityLines?.close();
         removeActiveRun();
         reject(error);
       });
       child.on("close", (code) => {
         clearTimeout(timer);
+        activityLines?.close();
         removeActiveRun();
         const raw = Buffer.concat(stdout).toString("utf8");
         const err = Buffer.concat(stderr).toString("utf8");
         if (code !== 0) {
-          reject(formatCodexExecFailure(code, err));
+          const error = formatCodexExecFailure(code, err);
+          reject(activeRun.isCancelled ? new CodexRunError(error.message, "cancelled") : error);
           return;
         }
         const parsed = parseCodexExecOutput(raw);
@@ -115,11 +140,13 @@ export class CodexExecRunner {
     });
   }
 
-  async stop(threadId?: string): Promise<void> {
-    const target = threadId
-      ? [...this.activeRuns].reverse().find((run) => run.threadId === threadId)
-      : this.activeRuns.at(-1);
-    target?.child.kill();
+  async stop(threadId?: string, queueKey?: string): Promise<void> {
+    const target = [...this.activeRuns].reverse().find((run) => threadId !== undefined
+      ? run.threadId === threadId
+      : queueKey === undefined || run.queueKey === queueKey);
+    if (target && target.child.exitCode === null && target.child.signalCode === null && target.child.kill()) {
+      target.isCancelled = true;
+    }
   }
 
   close(): void {

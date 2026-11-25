@@ -134,6 +134,9 @@ const configSchema = z.object({
   model: z.string().optional(),
   effort: z.string().optional(),
   streamReplies: z.boolean().optional(),
+  feishuReactions: z.boolean().optional(),
+  feishuProgressCards: z.boolean().optional(),
+  feishuStreamingReplies: z.boolean().optional(),
   taskboardEnabled: z.boolean().optional(),
   taskboardUrl: z.string().url().refine((value) => {
     const url = new URL(value);

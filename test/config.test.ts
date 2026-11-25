@@ -45,6 +45,25 @@ test("enables process progress by default while preserving an explicit opt-out",
   assert.equal(loadConfig(paths, "/tmp/project").streamReplies, false);
 });
 
+test("loads independent Feishu feedback switches for existing and updated configurations", (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-feishu-config-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const paths = resolveStatePaths(stateDir);
+
+  fs.writeFileSync(paths.configPath, JSON.stringify({ streamReplies: false }));
+  let config = loadConfig(paths);
+  assert.equal(config.feishuReactions, true);
+  assert.equal(config.feishuProgressCards, true);
+  assert.equal(config.feishuStreamingReplies, false);
+
+  saveConfig(paths, { ...config, feishuReactions: false, feishuProgressCards: false, feishuStreamingReplies: true });
+  config = loadConfig(paths);
+  assert.equal(config.feishuReactions, false);
+  assert.equal(config.feishuProgressCards, false);
+  assert.equal(config.feishuStreamingReplies, true);
+  assert.equal(config.streamReplies, false);
+});
+
 test("loads an explicit codex exec sandbox", (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-config-"));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));

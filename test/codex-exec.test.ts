@@ -3,6 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import type { CodexActivityEvent } from "../src/codex/activity.js";
 import {
   buildCodexExecArgs,
   CodexExecRunner,
@@ -11,6 +12,8 @@ import {
   parseCodexExecOutput,
   resolveCodexCommand
 } from "../src/codex/exec-runner.js";
+import { codexFailureOutcome } from "../src/codex/run-lifecycle.js";
+import { HybridCodexRunner } from "../src/codex/runner.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -175,17 +178,49 @@ test("extracts nested agent_message text and thread id from codex json output", 
   });
 });
 
-test("stops the active codex exec fallback process", async (t) => {
+test("observes activity before stopping the active codex exec process", async (t) => {
   const runner = new CodexExecRunner({
     codexBin: path.join(fixturesDir, "fake-codex-exec-hold.mjs"),
     timeoutMs: 2_000
   });
   t.after(() => runner.close());
 
-  const run = runner.run({ prompt: "hold", cwd: fixturesDir });
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  await runner.stop();
-  await assert.rejects(run, /exited with code/i);
+  let onExecutionStarted!: () => void;
+  const started = new Promise<void>((resolve) => { onExecutionStarted = resolve; });
+  let onActivity!: (event: CodexActivityEvent) => void;
+  const observed = new Promise<CodexActivityEvent>((resolve) => { onActivity = resolve; });
+  const run = runner.run({ prompt: "hold", cwd: fixturesDir, queueKey: "managed-stop", onExecutionStarted, onActivity });
+  await Promise.race([started, run]);
+  assert.deepEqual(await Promise.race([observed, run]), { id: "running-command", kind: "command", status: "running" });
+  await runner.stop("thread-unrelated");
+  await runner.stop(undefined, "managed-unrelated");
+  await runner.stop(undefined, "managed-stop");
+  await assert.rejects(run, (error: Error) => {
+    assert.match(error.message, /exited with code/i);
+    assert.equal(codexFailureOutcome(error), "cancelled");
+    return true;
+  });
+});
+
+test("reports an exec timeout after the process starts without switching backends", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "exec",
+    codexBin: path.join(fixturesDir, "fake-codex-exec-hold.mjs"),
+    timeoutMs: 250
+  });
+  t.after(() => runner.close());
+  let starts = 0;
+
+  await assert.rejects(runner.run({
+    prompt: "hold",
+    cwd: fixturesDir,
+    onExecutionStarted: () => { starts += 1; }
+  }), (error: Error) => {
+    assert.match(error.message, /codex exec timed out/i);
+    assert.equal(codexFailureOutcome(error), "timed_out");
+    return true;
+  });
+  assert.equal(starts, 1);
 });
 
 test("does not misreport completed exec messages as token deltas", async (t) => {
@@ -208,4 +243,32 @@ test("does not misreport completed exec messages as token deltas", async (t) => 
   assert.deepEqual(deltas, []);
   assert.equal(result.text, "第一段。\n\n第二段。");
   assert.equal(result.threadId, "thread-exec-stream");
+});
+
+test("observes live exec JSONL activity without streaming completed messages", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "exec",
+    codexBin: path.join(fixturesDir, "fake-codex-exec-stream.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  const events: CodexActivityEvent[] = [];
+  const deltas: string[] = [];
+
+  const result = await runner.run({
+    prompt: "structured-observers",
+    cwd: fixturesDir,
+    onActivity: (event) => events.push(event),
+    onFinalAnswerDelta: (delta) => deltas.push(delta)
+  });
+
+  assert.deepEqual(events, [
+    { id: "cmd-1", kind: "command", status: "running" },
+    { id: "collab-1", kind: "agent", status: "running", agents: [{ id: "a", status: "pending" }] },
+    { id: "cmd-1", kind: "command", status: "failed" },
+    { id: "collab-1", kind: "agent", status: "completed", agents: [{ id: "a", status: "completed" }] },
+    { id: "search-1", kind: "search", status: "completed" }
+  ]);
+  assert.deepEqual(deltas, []);
+  assert.equal(result.text, "第一段。\n\n第二段。");
 });

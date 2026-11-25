@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 
+import { notifyCodexObserver, parseAppServerActivity, type CodexActivityEvent } from "./activity.js";
 import { resolveCodexCommand, type CodexRunResult } from "./exec-runner.js";
 import { parseAccountRateLimits, type CodexAccountBalance } from "./account-balance.js";
 import {
@@ -9,6 +10,7 @@ import {
   parseAppServerApproval,
   type CodexApprovalHandler
 } from "./approval.js";
+import { CodexRunError, notifyExecutionStarted } from "./run-lifecycle.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 
 export type AppServerRunnerOptions = {
@@ -24,6 +26,9 @@ export type CodexRunnerInput = {
   queueKey?: string;
   model?: string;
   effort?: string;
+  onExecutionStarted?: () => void;
+  onActivity?: (event: CodexActivityEvent) => void;
+  onFinalAnswerDelta?: (delta: string) => void;
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
   onApproval?: CodexApprovalHandler;
@@ -120,6 +125,12 @@ type TurnCompletion = {
   error?: string;
 };
 
+type ActiveTurn = {
+  threadId: string;
+  turnId: string;
+  queueKey?: string;
+};
+
 type TurnWaiter = {
   resolve: (value: CodexRunResult) => void;
   reject: (error: Error) => void;
@@ -130,8 +141,15 @@ type TurnWaiter = {
 type TurnStream = {
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
+  onActivity?: (event: CodexActivityEvent) => void;
+  onFinalAnswerDelta?: (delta: string) => void;
+  finalAnswerItemId?: string;
   chain: Promise<void>;
 };
+
+type TurnObservation =
+  | { type: "activity"; activity: CodexActivityEvent }
+  | { type: "finalAnswerDelta"; itemId: string; delta: string };
 
 type QueuedTurnEvent = {
   type: "delta" | "progress";
@@ -164,7 +182,7 @@ export class AppServerCodexRunner {
   private nextId = 1;
   private stderr = "";
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
-  private readonly activeTurns = new Map<string, string>();
+  private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly approvalHandlersByThread = new Map<string, CodexApprovalHandler>();
   private readonly dynamicToolHandlersByThread = new Map<string, CodexDynamicToolHandler>();
   private readonly userInputHandlersByThread = new Map<string, CodexUserInputHandler>();
@@ -173,6 +191,7 @@ export class AppServerCodexRunner {
   private readonly turnTexts = new Map<string, string>();
   private readonly completedTurns = new Map<string, TurnCompletion>();
   private readonly turnStreams = new Map<string, TurnStream>();
+  private readonly pendingTurnObservations = new Map<string, Map<string, TurnObservation[]>>();
   private readonly queuedTurnEvents = new Map<string, QueuedTurnEvent[]>();
   private readonly itemPhasesByTurn = new Map<string, Map<string, string>>();
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
@@ -237,6 +256,11 @@ export class AppServerCodexRunner {
     if (input.onApproval) this.approvalHandlersByThread.set(threadId, input.onApproval);
     if (input.onDynamicToolCall) this.dynamicToolHandlersByThread.set(threadId, input.onDynamicToolCall);
     if (input.onUserInput) this.userInputHandlersByThread.set(threadId, input.onUserInput);
+    // 同一批输出可能先交付通知，再由 run 处理 turn/start 响应。
+    const pendingObservations = input.onActivity || input.onFinalAnswerDelta
+      ? new Map<string, TurnObservation[]>()
+      : undefined;
+    if (pendingObservations) this.pendingTurnObservations.set(threadId, pendingObservations);
     try {
       turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
     } catch (error) {
@@ -256,6 +280,10 @@ export class AppServerCodexRunner {
         this.userInputHandlersByThread.delete(threadId);
         throw retryError;
       }
+    } finally {
+      if (pendingObservations && this.pendingTurnObservations.get(threadId) === pendingObservations) {
+        this.pendingTurnObservations.delete(threadId);
+      }
     }
     const turn = turnResponse.turn as Record<string, unknown> | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : undefined;
@@ -266,20 +294,33 @@ export class AppServerCodexRunner {
       throw new Error("Codex app-server did not return a turn id");
     }
 
-    this.activeTurns.set(threadId, turnId);
-    if (input.onDelta || input.onProgress) {
-      const key = turnKey(threadId, turnId);
-      this.turnStreams.set(key, {
+    const key = turnKey(threadId, turnId);
+    if (!this.completedTurns.has(key)) {
+      this.activeTurns.set(threadId, { threadId, turnId, queueKey: input.queueKey });
+    }
+    let stream: TurnStream | undefined;
+    if (input.onDelta || input.onProgress || input.onActivity || input.onFinalAnswerDelta) {
+      stream = {
         onDelta: input.onDelta,
         onProgress: input.onProgress,
+        onActivity: input.onActivity,
+        onFinalAnswerDelta: input.onFinalAnswerDelta,
         chain: Promise.resolve()
-      });
+      };
+      this.turnStreams.set(key, stream);
       for (const event of this.queuedTurnEvents.get(key) ?? []) {
         this.enqueueTurnEvent(key, event);
       }
       this.queuedTurnEvents.delete(key);
     }
-    return this.waitForTurn(threadId, turnId);
+    const completion = this.waitForTurn(threadId, turnId);
+    notifyExecutionStarted(input.onExecutionStarted);
+    if (stream) {
+      for (const observation of pendingObservations?.get(key) ?? []) {
+        this.deliverTurnObservation(stream, observation);
+      }
+    }
+    return completion;
   }
 
   async listSessions(): Promise<unknown> {
@@ -371,22 +412,19 @@ export class AppServerCodexRunner {
     await this.request("thread/goal/clear", { threadId });
   }
 
-  async stop(threadId?: string): Promise<void> {
+  async stop(threadId?: string, queueKey?: string): Promise<void> {
     if (!this.initialized || !this.child || this.child.exitCode !== null) {
       return;
     }
 
-    const target = threadId && this.activeTurns.has(threadId)
-      ? { threadId, turnId: this.activeTurns.get(threadId) as string }
-      : Array.from(this.activeTurns.entries(), ([activeThreadId, turnId]) => ({
-        threadId: activeThreadId,
-        turnId
-      })).at(-1);
+    const target = threadId !== undefined
+      ? this.activeTurns.get(threadId)
+      : [...this.activeTurns.values()].reverse().find((turn) => queueKey === undefined || turn.queueKey === queueKey);
     if (!target) {
       return;
     }
 
-    await this.request("turn/interrupt", target);
+    await this.request("turn/interrupt", { threadId: target.threadId, turnId: target.turnId });
   }
 
   close(): void {
@@ -461,10 +499,10 @@ export class AppServerCodexRunner {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        const error = new Error(`app-server request ${method} timed out after ${timeoutMs}ms`);
+        const error = new CodexRunError(`app-server request ${method} timed out after ${timeoutMs}ms`, "timed_out");
         this.pending.delete(id);
         reject(error);
-        this.failTransport(error, true);
+        this.failTransport(new Error(error.message, { cause: error }), true);
       }, timeoutMs);
       this.pending.set(id, { method, resolve, reject, timer });
       try {
@@ -526,13 +564,16 @@ export class AppServerCodexRunner {
   private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
     if (method === "item/started") {
       const key = turnKeyFromParams(params);
+      if (!key) return;
       const item = params.item as Record<string, unknown> | undefined;
       const itemId = typeof item?.id === "string" ? item.id : undefined;
-      if (key && itemId && item?.type === "agentMessage" && typeof item.phase === "string") {
+      if (itemId && item?.type === "agentMessage" && typeof item.phase === "string") {
         const phases = this.itemPhasesByTurn.get(key) ?? new Map<string, string>();
         phases.set(itemId, item.phase);
         this.itemPhasesByTurn.set(key, phases);
       }
+      const activity = parseAppServerActivity(item, "started");
+      if (activity) this.publishTurnObservation(params.threadId, key, { type: "activity", activity });
       return;
     }
 
@@ -540,8 +581,13 @@ export class AppServerCodexRunner {
       const key = turnKeyFromParams(params);
       const itemId = typeof params.itemId === "string" ? params.itemId : undefined;
       const delta = typeof params.delta === "string" ? params.delta : "";
-      if (!key || !itemId || !delta || this.itemPhasesByTurn.get(key)?.get(itemId) === "commentary") {
+      if (!key || !itemId || !delta) return;
+      const phase = this.itemPhasesByTurn.get(key)?.get(itemId);
+      if (phase === "commentary") {
         return;
+      }
+      if (phase === "final_answer") {
+        this.publishTurnObservation(params.threadId, key, { type: "finalAnswerDelta", itemId, delta });
       }
       if (this.turnStreams.has(key)) {
         this.enqueueTurnEvent(key, { type: "delta", text: delta });
@@ -560,6 +606,8 @@ export class AppServerCodexRunner {
       const key = turnKey(threadId, turnId);
       this.appendTurnEvent(key, raw);
       const item = params.item as Record<string, unknown> | undefined;
+      const activity = parseAppServerActivity(item, "completed");
+      if (activity) this.publishTurnObservation(threadId, key, { type: "activity", activity });
       if (item?.type === "agentMessage" && typeof item.text === "string") {
         if (item.phase === "commentary") {
           const progress = item.text.trim();
@@ -596,7 +644,7 @@ export class AppServerCodexRunner {
       raw: (this.turnEvents.get(key) ?? []).join("\n"),
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
-    this.activeTurns.delete(threadId);
+    if (this.activeTurns.get(threadId)?.turnId === turnId) this.activeTurns.delete(threadId);
     this.approvalHandlersByThread.delete(threadId);
     this.dynamicToolHandlersByThread.delete(threadId);
     this.userInputHandlersByThread.delete(threadId);
@@ -624,9 +672,9 @@ export class AppServerCodexRunner {
     return new Promise((resolve, reject) => {
       const expire = () => {
         this.turnWaiters.delete(key);
-        const error = new Error(`app-server turn timed out after ${timeoutMs}ms`);
+        const error = new CodexRunError(`app-server turn timed out after ${timeoutMs}ms`, "timed_out");
         reject(error);
-        this.failTransport(error, true);
+        this.failTransport(new Error(error.message, { cause: error }), true);
       };
       const waiter: TurnWaiter = {
         resolve,
@@ -665,7 +713,7 @@ export class AppServerCodexRunner {
         await onProgress?.("当前会话的上一条任务仍在执行，已排队等待完成。");
       }
       if (Date.now() >= deadline) {
-        throw new Error(`等待已有会话空闲超时（${Math.round(timeoutMs / 1_000)} 秒）`);
+        throw new CodexRunError(`等待已有会话空闲超时（${Math.round(timeoutMs / 1_000)} 秒）`, "timed_out");
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
@@ -690,7 +738,7 @@ export class AppServerCodexRunner {
       return;
     }
     if (completion.status === "interrupted") {
-      reject(new Error("Codex app-server turn was interrupted"));
+      reject(new CodexRunError("Codex app-server turn was interrupted", "cancelled"));
       return;
     }
     reject(new Error(completion.error ?? `Codex app-server turn ended with status ${completion.status}`));
@@ -706,6 +754,32 @@ export class AppServerCodexRunner {
     const queued = this.queuedTurnEvents.get(key) ?? [];
     queued.push(event);
     this.queuedTurnEvents.set(key, queued);
+  }
+
+  private publishTurnObservation(threadId: unknown, key: string, observation: TurnObservation): void {
+    const stream = this.turnStreams.get(key);
+    if (stream) {
+      this.deliverTurnObservation(stream, observation);
+      return;
+    }
+    const pending = typeof threadId === "string" ? this.pendingTurnObservations.get(threadId) : undefined;
+    if (!pending) return;
+    const observations = pending.get(key) ?? [];
+    observations.push(observation);
+    pending.set(key, observations);
+  }
+
+  private deliverTurnObservation(stream: TurnStream, observation: TurnObservation): void {
+    if (observation.type === "activity") {
+      notifyCodexObserver(stream.onActivity, observation.activity);
+      return;
+    }
+    if (!stream.onFinalAnswerDelta) return;
+    // 固定首个明确标为最终答案且已收到增量的条目，避免混合多条消息。
+    stream.finalAnswerItemId ??= observation.itemId;
+    if (stream.finalAnswerItemId === observation.itemId) {
+      notifyCodexObserver(stream.onFinalAnswerDelta, observation.delta);
+    }
   }
 
   private enqueueTurnEvent(key: string, event: QueuedTurnEvent): void {
@@ -851,6 +925,7 @@ export class AppServerCodexRunner {
     this.turnTexts.clear();
     this.completedTurns.clear();
     this.turnStreams.clear();
+    this.pendingTurnObservations.clear();
     this.queuedTurnEvents.clear();
     this.itemPhasesByTurn.clear();
     this.runtimeInfoByThread.clear();

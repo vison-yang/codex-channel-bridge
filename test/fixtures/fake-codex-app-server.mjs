@@ -40,6 +40,55 @@ function completedTurn(id, status, error = null) {
   };
 }
 
+function sendObservedTurn(requestId, threadId, turnId) {
+  const item = (lifecycle, value, observedTurnId = turnId) => {
+    send({ method: `item/${lifecycle}`, params: { threadId, turnId: observedTurnId, item: value } });
+  };
+  const command = {
+    id: "cmd-1", type: "commandExecution", status: "inProgress",
+    command: "private command", cwd: "/private/workspace", aggregatedOutput: "private output"
+  };
+  item("started", command);
+  item("started", { ...command, id: "foreign" }, "other-turn");
+  respond(requestId, { turn: completedTurn(turnId, "inProgress") });
+  item("completed", { ...command, status: "failed" });
+  item("completed", { id: "file-1", type: "fileChange", status: "declined", changes: [{ path: "/private/file" }] });
+  item("started", { id: "mcp-1", type: "mcpToolCall", status: "inProgress", arguments: { secret: "private arguments" } });
+  item("completed", { id: "tool-1", type: "dynamicToolCall", status: "completed", contentItems: ["private content"] });
+  item("started", { id: "search-1", type: "webSearch", query: "private query" });
+  item("completed", { id: "search-1", type: "webSearch", results: ["private results"] });
+  item("completed", { id: "image-1", type: "imageGeneration", status: "completed", savedPath: "/private/image" });
+  item("completed", {
+    id: "collab-1", type: "collabAgentToolCall", status: "completed", prompt: "private prompt",
+    agentsStates: {
+      a: { status: "pendingInit", message: "private message" },
+      b: { status: "errored" },
+      c: { status: "shutdown" },
+      d: { status: "notFound" },
+      e: { status: "unknown" }
+    }
+  });
+  item("completed", { id: "sub-agent-1", type: "subAgentActivity", kind: "started", agentThreadId: "f", agentPath: "/private/agent" });
+  item("started", { id: "unknown-state", type: "commandExecution", status: "unknown" });
+  item("completed", { id: "reasoning-1", type: "reasoning", summary: ["private reasoning"] });
+  item("completed", { id: "other-1", type: "unknown", status: "completed", output: "private output" });
+
+  for (const [id, phase, deltas] of [
+    ["commentary-1", "commentary", ["commentary"]],
+    ["partial-1", "partial_answer", ["partial"]],
+    ["unknown-1", null, ["unknown phase"]],
+    ["final-1", "final_answer", ["first ", "answer"]],
+    ["final-2", "final_answer", ["second answer"]]
+  ]) {
+    item("started", { id, type: "agentMessage", phase, text: "" });
+    for (const delta of deltas) {
+      send({ method: "item/agentMessage/delta", params: { threadId, turnId, itemId: id, delta } });
+    }
+    item("completed", { id, type: "agentMessage", phase, text: deltas.join("") });
+  }
+  send({ method: "turn/completed", params: { threadId, turn: completedTurn(turnId, "completed") } });
+}
+
 rl.on("line", (line) => {
   const message = JSON.parse(line);
 
@@ -311,6 +360,11 @@ rl.on("line", (line) => {
       }
     }
     activeTurns.set(message.params.threadId, turnId);
+    if (prompt === "structured-observers") {
+      sendObservedTurn(message.id, message.params.threadId, turnId);
+      activeTurns.delete(message.params.threadId);
+      return;
+    }
     respond(message.id, { turn: completedTurn(turnId, "inProgress") });
     if (["command", "file", "permissions"].includes(approvalKind)) {
       const approvalId = `approval-${turnId}`;

@@ -3,10 +3,54 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import type { CodexActivityEvent } from "../src/codex/activity.js";
 import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
+import { codexFailureOutcome } from "../src/codex/run-lifecycle.js";
 import { HybridCodexRunner } from "../src/codex/runner.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+
+test("observes typed activities and deltas from one explicit final-answer item", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  const events: ("started" | CodexActivityEvent)[] = [];
+  const streamed: string[] = [];
+  const legacyDeltas: string[] = [];
+  const legacyProgress: string[] = [];
+
+  const result = await runner.run({
+    prompt: "structured-observers",
+    cwd: fixturesDir,
+    onExecutionStarted: () => events.push("started"),
+    onActivity: (event) => events.push(event),
+    onFinalAnswerDelta: (delta) => streamed.push(delta),
+    onDelta: (delta) => { legacyDeltas.push(delta); },
+    onProgress: (message) => { legacyProgress.push(message); }
+  });
+
+  assert.deepEqual(events, [
+    "started",
+    { id: "cmd-1", kind: "command", status: "running" },
+    { id: "cmd-1", kind: "command", status: "failed" },
+    { id: "file-1", kind: "file", status: "failed" },
+    { id: "mcp-1", kind: "mcp", status: "running" },
+    { id: "tool-1", kind: "dynamic", status: "completed" },
+    { id: "search-1", kind: "search", status: "running" },
+    { id: "search-1", kind: "search", status: "completed" },
+    { id: "image-1", kind: "image", status: "completed" },
+    { id: "collab-1", kind: "agent", status: "completed", agents: [
+      { id: "a", status: "pending" }, { id: "b", status: "failed" }, { id: "c", status: "stopped" }
+    ] },
+    { id: "sub-agent-1", kind: "agent", status: "running", agents: [{ id: "f", status: "running" }] }
+  ]);
+  assert.deepEqual(streamed, ["first ", "answer"]);
+  assert.deepEqual(legacyDeltas, ["partial", "unknown phase", "first ", "answer", "second answer"]);
+  assert.deepEqual(legacyProgress, ["commentary"]);
+  assert.equal(result.text, "second answer");
+});
 
 test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
   const runner = new AppServerCodexRunner({
@@ -286,24 +330,58 @@ test("declines an app-server approval when the channel rejects it", async (t) =>
   assert.equal(result.text, "approval:command:decline");
 });
 
-test("interrupts the active V2 turn with both threadId and turnId", async (t) => {
+test("interrupts only the active V2 turn scoped to a new managed session", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
     requestTimeoutMs: 2_000
   });
   t.after(() => runner.close());
 
-  const run = runner.run({ prompt: "hold", cwd: "/tmp/project", threadId: "thread-stop" });
-  const outcome = run.then(
-    (value) => ({ value, error: undefined }),
-    (error: Error) => ({ value: undefined, error })
-  );
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    await runner.stop("thread-stop");
-  }
-  const result = await outcome;
-  assert.match(result.error?.message ?? "", /interrupted/i);
+  let onExecutionStarted!: () => void;
+  const started = new Promise<void>((resolve) => { onExecutionStarted = resolve; });
+  const run = runner.run({ prompt: "hold", cwd: "/tmp/project", queueKey: "managed-stop", onExecutionStarted });
+  await Promise.race([started, run]);
+  let onUnrelatedStarted!: () => void;
+  const unrelatedStarted = new Promise<void>((resolve) => { onUnrelatedStarted = resolve; });
+  const unrelatedRun = runner.run({
+    prompt: "slow:unrelated",
+    cwd: "/tmp/project",
+    threadId: "thread-other",
+    queueKey: "managed-other",
+    onExecutionStarted: onUnrelatedStarted
+  });
+  await Promise.race([unrelatedStarted, unrelatedRun]);
+
+  await runner.stop("thread-unrelated");
+  await runner.stop(undefined, "managed-unrelated");
+  await runner.stop(undefined, "managed-stop");
+  await assert.rejects(run, (error: Error) => {
+    assert.match(error.message, /interrupted/i);
+    assert.equal(codexFailureOutcome(error), "cancelled");
+    return true;
+  });
+  assert.equal((await unrelatedRun).text, "reply:slow:unrelated");
+});
+
+test("reports an active app-server timeout without replaying the turn through exec", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "auto",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 500
+  });
+  t.after(() => runner.close());
+  let starts = 0;
+
+  await assert.rejects(runner.run({
+    prompt: "hold",
+    cwd: fixturesDir,
+    onExecutionStarted: () => { starts += 1; }
+  }), (error: Error) => {
+    assert.match(error.message, /app-server turn timed out/i);
+    assert.equal(codexFailureOutcome(error), "timed_out");
+    return true;
+  });
+  assert.equal(starts, 1);
 });
 
 test("serializes concurrent turns for the same managed session", async (t) => {
@@ -314,20 +392,22 @@ test("serializes concurrent turns for the same managed session", async (t) => {
   });
   t.after(() => runner.close());
 
-  const completionOrder: string[] = [];
+  const lifecycleOrder: string[] = [];
   const first = runner.run({
     prompt: "slow:first",
     cwd: "/tmp/project",
-    queueKey: "managed-session"
-  }).then(() => completionOrder.push("first"));
+    queueKey: "managed-session",
+    onExecutionStarted: () => lifecycleOrder.push("start:first")
+  }).then(() => lifecycleOrder.push("finish:first"));
   const second = runner.run({
     prompt: "second",
     cwd: "/tmp/project",
-    queueKey: "managed-session"
-  }).then(() => completionOrder.push("second"));
+    queueKey: "managed-session",
+    onExecutionStarted: () => lifecycleOrder.push("start:second")
+  }).then(() => lifecycleOrder.push("finish:second"));
 
   await Promise.all([first, second]);
-  assert.deepEqual(completionOrder, ["first", "second"]);
+  assert.deepEqual(lifecycleOrder, ["start:first", "finish:first", "start:second", "finish:second"]);
 });
 
 test("waits for an existing thread turn before continuing it", async (t) => {
@@ -342,11 +422,12 @@ test("waits for an existing thread turn before continuing it", async (t) => {
     prompt: "continue",
     cwd: "/tmp/project",
     threadId: "thread-external-busy",
+    onExecutionStarted: () => progress.push("started"),
     onProgress: (message) => progress.push(message)
   });
 
   assert.equal(result.text, "reply:continue");
-  assert.deepEqual(progress, ["当前会话的上一条任务仍在执行，已排队等待完成。", "working:continue"]);
+  assert.deepEqual(progress, ["当前会话的上一条任务仍在执行，已排队等待完成。", "started", "working:continue"]);
 });
 
 test("auto backend falls back to codex exec for an existing thread", async (t) => {
@@ -356,13 +437,16 @@ test("auto backend falls back to codex exec for an existing thread", async (t) =
     timeoutMs: 2_000
   });
   t.after(() => runner.close());
+  let starts = 0;
 
   const result = await runner.run({
     prompt: "continue",
     cwd: fixturesDir,
-    threadId: "thread-existing"
+    threadId: "thread-existing",
+    onExecutionStarted: () => { starts += 1; }
   });
 
+  assert.equal(starts, 1);
   assert.equal(result.threadId, "thread-existing");
   assert.match(result.text, /used codex exec fallback/i);
   assert.match(result.text, /exec-resumed/);
