@@ -40,14 +40,14 @@ async function waitFor(check: () => boolean, description: string): Promise<void>
   }
 }
 
-function message(id: string, options: { actor?: string; chat?: string; image?: boolean } = {}) {
+function message(id: string, options: { actor?: string; chat?: string; image?: boolean; text?: string } = {}) {
   return {
     sender: { sender_id: { open_id: options.actor ?? "ou_allowed" }, sender_type: "user" },
     message: {
       message_id: id,
       chat_id: options.chat ?? "oc_test",
       message_type: options.image ? "image" : "text",
-      content: JSON.stringify(options.image ? { image_key: "img_test" } : { text: `ordinary message ${id}` })
+      content: JSON.stringify(options.image ? { image_key: "img_test" } : { text: options.text ?? `ordinary message ${id}` })
     }
   };
 }
@@ -192,6 +192,7 @@ function createFixture(t: TestContext, options: {
   const handler = dispatcher.handles.get("im.message.receive_v1");
   assert.ok(handler);
   return {
+    store,
     steps,
     errors,
     dispatch: (event: ReturnType<typeof message>) => handler(event),
@@ -236,6 +237,26 @@ test("acknowledges a direct message before classification and marks success only
   const done = fixture.steps.findIndex((step) => step.kind === "reaction-request" && step.emoji === "DONE");
   assert.ok(sendResponse < deletion && deletion < done);
   assert.equal(fixture.steps[deletion].reactionId, "reaction-om_text-Typing");
+  assert.deepEqual(fixture.errors, []);
+});
+
+test("routes exact Feishu new-session text without using the classifier or runner", async (t) => {
+  const fixture = createFixture(t, { classify: async () => {} });
+  await fixture.dispatch(message("om_new_session", { text: " 新建会话 " }));
+
+  const session = fixture.store.getActiveSession("oc_test");
+  assert.ok(session);
+  assert.equal(session.projectId, fixture.store.getActiveProject("oc_test")?.id);
+  assert.equal(session.threadId, undefined);
+  assert.equal(fixture.has("classify-start"), false);
+  assert.equal(fixture.has("runner-invoked"), false);
+  assert.equal(fixture.has("send-response"), true);
+
+  await fixture.dispatch(message("om_question", { text: "如何新建会话？" }));
+
+  assert.equal(fixture.has("classify-start"), true);
+  assert.equal(fixture.has("runner-invoked"), true);
+  assert.equal(fixture.store.getActiveSession("oc_test")?.id, session.id);
   assert.deepEqual(fixture.errors, []);
 });
 

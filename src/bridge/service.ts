@@ -209,8 +209,9 @@ export class BridgeService {
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
 
     const channelCapabilities = await (this.options.channelCapabilities?.() ?? []);
-    const slashCommand = parseCommand(scopedMessage.text, channelCapabilityAliases(channelCapabilities));
-    const friendlyIntent = slashCommand
+    const commandText = scopedMessage.text.trim() === "新建会话" ? "/new" : scopedMessage.text;
+    const explicitCommand = parseCommand(commandText, channelCapabilityAliases(channelCapabilities));
+    const friendlyIntent = explicitCommand
       ? undefined
       : await this.resolveFriendlyChannelIntent(
           message.senderId,
@@ -222,11 +223,11 @@ export class BridgeService {
       await this.reply(replyTargetId, friendlyIntent.text);
       return;
     }
-    const commands = slashCommand
-      ? [slashCommand]
+    const commands = explicitCommand
+      ? [explicitCommand]
       : commandsFromFriendlyChannelIntent(friendlyIntent);
     const continueAsConversation = Boolean(
-      !slashCommand && commands && friendlyCommandsContinueConversation(commands)
+      !explicitCommand && commands && friendlyCommandsContinueConversation(commands)
     );
     const deferredCommands: ChannelCommand[] = [];
     if (commands) {
