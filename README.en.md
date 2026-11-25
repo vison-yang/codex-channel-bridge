@@ -143,6 +143,7 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 - Delete removes only the bridge record, not Codex's own history files.
 - `/sessions` lists up to ten recently active bridge or Codex Desktop sessions from the current project; `/session R1` binds the real Codex thread and continues it. `/resume` remains a compatibility alias.
 - `/new` creates and binds a new managed session inside the current project.
+- If another Codex client still holds the write lock on an idle session, the bridge forks its saved history and continues on the new thread. The original session stays available in the original client.
 
 ## Projects, running tasks, and notifications
 

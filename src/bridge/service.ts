@@ -441,7 +441,7 @@ export class BridgeService {
         this.approvals.declineAll(message.senderId);
         this.userInputs.cancelSender(message.senderId);
         const session = this.executionSession(message.senderId);
-        if (session) await this.runner.stop(session.threadId || undefined, session.threadId || session.id);
+        if (session) await this.runner.stop(session.threadId || undefined, session.id);
         await this.reply(message.senderId, "Stop signal sent.");
         return;
       }
@@ -1488,7 +1488,15 @@ export class BridgeService {
           prompt: qaContext ? buildQaPrompt(basePrompt, project, qaContext) : basePrompt,
           cwd: workspace,
           threadId,
-          queueKey: threadId ?? session.id,
+          queueKey: session.id,
+          getBoundThreadId: () => this.options.stateStore.getSession(session.id)?.threadId,
+          onThreadForked: (forkedThreadId) => {
+            this.options.stateStore.setSessionThread(session.id, forkedThreadId);
+            void this.reply(message.senderId, "原 Codex 会话由另一个客户端占用。本轮将在保留历史的独立会话中继续。")
+              .catch((error: unknown) => {
+                console.warn("[codex-channel-bridge] failed to send session continuation notice", error instanceof Error ? error.message : String(error));
+              });
+          },
           onExecutionStarted: feedback ? () => feedback.start(progressEnabled) : undefined,
           onActivity: progressEnabled ? feedback?.activity : undefined,
           onFinalAnswerDelta: stream ? (delta) => stream.delta(delta) : undefined,

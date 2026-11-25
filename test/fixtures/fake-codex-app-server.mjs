@@ -14,6 +14,11 @@ const goals = new Map();
 let externalBusyReads = 0;
 let ephemeralThreadStarted = false;
 let dynamicToolsEnabled = false;
+let writerForkCount = 0;
+let writerBusyReads = 0;
+let writerRaceResumed = false;
+let writerRaceReads = 0;
+const writerForkTurns = new Map();
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -203,6 +208,21 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/resume") {
+    const resumeError = {
+      "thread-writer-conflict": { code: -32600, message: "thread thread-writer-conflict already has an active writer" },
+      "thread-writer-busy": { code: -32600, message: "thread thread-writer-busy already has an active writer" },
+      "thread-writer-explicit": { code: -32600, message: "thread thread-writer-explicit already has an active writer" },
+      "thread-writer-race": { code: -32600, message: "thread thread-writer-race already has an active writer" },
+      "thread-writer-fork-denied": { code: -32600, message: "thread thread-writer-fork-denied already has an active writer" },
+      "thread-resume-missing": { code: -32600, message: "thread thread-resume-missing not found" },
+      "thread-resume-other-code": { code: -32602, message: "thread thread-resume-other-code already has an active writer" },
+      "thread-resume-other-writer": { code: -32600, message: "thread some-other-thread already has an active writer" }
+    }[message.params?.threadId];
+    if (resumeError) {
+      if (message.params?.threadId === "thread-writer-race") writerRaceResumed = true;
+      send({ id: message.id, error: resumeError });
+      return;
+    }
     const configuredPolicy = message.params?.threadId === "thread-explicit-policy-b";
     if ((configuredPolicy ? message.params?.approvalPolicy !== "on-request" : Object.hasOwn(message.params, "approvalPolicy"))
       || Object.hasOwn(message.params, "sandbox")
@@ -223,6 +243,32 @@ rl.on("line", (line) => {
       model: "resumed-model",
       reasoningEffort: "medium"
     });
+    return;
+  }
+
+  if (message.method === "thread/fork") {
+    const explicitPolicy = message.params?.threadId === "thread-writer-explicit";
+    if (message.params?.threadId === "thread-writer-fork-denied") {
+      fail(message.id, "fork denied by fixture");
+      return;
+    }
+    if (!["thread-writer-conflict", "thread-writer-busy", "thread-writer-explicit", "thread-writer-race"].includes(message.params?.threadId)
+      || message.params?.cwd !== (explicitPolicy ? "/tmp/writer-explicit-project" : "/tmp/writer-conflict-project")
+      || message.params?.excludeTurns !== true
+      || message.params?.deferGoalContinuation !== true
+      || message.params?.lastTurnId !== (message.params?.threadId === "thread-writer-race" ? "writer-race-terminal" : "history-turn-1")
+      || Object.hasOwn(message.params, "ephemeral")
+      || (explicitPolicy ? message.params?.approvalPolicy !== "on-request" : Object.hasOwn(message.params, "approvalPolicy"))
+      || Object.hasOwn(message.params, "sandbox")
+      || Object.hasOwn(message.params, "sandboxPolicy")
+      || (message.params?.threadId === "thread-writer-busy" && writerBusyReads < 2)
+      || (message.params?.threadId === "thread-writer-race" && writerRaceReads < 2)) {
+      fail(message.id, "thread/fork must preserve the workspace and inherited permissions without turns or goal continuation");
+      return;
+    }
+    const threadId = `thread-writer-fork-${++writerForkCount}`;
+    writerForkTurns.set(threadId, []);
+    respond(message.id, { thread: { id: threadId }, model: "resumed-model", reasoningEffort: "medium" });
     return;
   }
 
@@ -314,14 +360,18 @@ rl.on("line", (line) => {
     const activeTurnId = activeTurns.get(message.params.threadId)
       ?? (message.params.threadId === "thread-external-busy" && externalBusyReads++ === 0
         ? "external-turn"
-        : undefined);
+        : message.params.threadId === "thread-writer-busy" && writerBusyReads++ === 0
+          ? "external-writer-turn"
+          : message.params.threadId === "thread-writer-race" && writerRaceResumed && writerRaceReads++ === 0
+            ? "race-active-turn"
+            : undefined);
     respond(message.id, {
       thread: {
         id: message.params.threadId,
         turns: [
           {
             id: "history-turn-1",
-            status: "completed",
+            status: ["thread-writer-conflict", "thread-writer-busy", "thread-writer-race"].includes(message.params.threadId) ? "interrupted" : "completed",
             startedAt: 1_700_000_000,
             completedAt: 1_700_000_002,
             items: [
@@ -348,6 +398,13 @@ rl.on("line", (line) => {
               { type: "reasoning", id: "history-reasoning-1", summary: [], content: ["hidden"] }
             ]
           },
+          ...(writerForkTurns.get(message.params.threadId) ?? []).map((prompt, index) => ({
+            ...completedTurn(`fork-history-turn-${index}`, "completed"),
+            items: [{ type: "userMessage", id: `fork-history-user-${index}`, content: [{ type: "text", text: prompt }] }]
+          })),
+          ...(message.params.threadId === "thread-writer-race" && writerRaceReads >= 2
+            ? [completedTurn("writer-race-terminal", "completed")]
+            : []),
           ...(activeTurnId ? [completedTurn(activeTurnId, "inProgress")] : [])
         ]
       }
@@ -370,7 +427,7 @@ rl.on("line", (line) => {
       return;
     }
     const isEphemeral = prompt === "classify-intent";
-    const configuredPolicy = ["/tmp/project-explicit-policy-a", "/tmp/project-explicit-policy-b"].includes(message.params?.cwd);
+    const configuredPolicy = ["/tmp/project-explicit-policy-a", "/tmp/project-explicit-policy-b", "/tmp/writer-explicit-project"].includes(message.params?.cwd);
     if ((isEphemeral && message.params?.approvalPolicy !== "never")
       || (!isEphemeral && (configuredPolicy
         ? message.params?.approvalPolicy !== "on-request"
@@ -391,10 +448,15 @@ rl.on("line", (line) => {
       fail(message.id, "intent classification must use an ephemeral read-only thread with output schema");
       return;
     }
-    if (!isEphemeral && prompt !== "verify-danger-full-access" && Object.hasOwn(message.params, "sandboxPolicy")) {
+    if (prompt === "fork-explicit-policy" && message.params?.sandboxPolicy?.type !== "workspaceWrite") {
+      fail(message.id, "forked turn must preserve the configured workspace-write sandbox");
+      return;
+    }
+    if (!isEphemeral && !["verify-danger-full-access", "fork-explicit-policy"].includes(prompt) && Object.hasOwn(message.params, "sandboxPolicy")) {
       fail(message.id, "ordinary turn/start must inherit the project sandbox");
       return;
     }
+    writerForkTurns.get(message.params.threadId)?.push(prompt);
     if (prompt === "plan-mode") {
       if (!experimentalApiEnabled) {
         fail(message.id, "turn/start.collaborationMode requires experimentalApi capability");

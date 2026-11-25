@@ -421,6 +421,11 @@ export class AccountManager {
       await service.handleMessage(messageWithConversation);
     };
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      if (channel !== "weixin") {
+        const detail = error instanceof Error ? error.message : String(error);
+        const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : undefined;
+        console.error(`[codex-channel-bridge] ${channel} message handling failed`, detail, ...(cause ? [cause] : []));
+      }
       await this.sendChannelText(entry, {
         recipientId: message.replyTargetId ?? message.senderId,
         text: userFacingMessageHandlingError(error),
@@ -874,7 +879,9 @@ export class AccountManager {
         ),
         cwd: session.workspace,
         threadId: session.threadId,
-        queueKey: session.threadId ?? session.id,
+        queueKey: session.id,
+        getBoundThreadId: () => store.getSession(session.id)?.threadId,
+        onThreadForked: (forkedThreadId) => { store.setSessionThread(session.id, forkedThreadId); },
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
         onApproval: (request, signal) => this.requestProjectApprovalForSession(accountId, session, request, signal),

@@ -15,7 +15,12 @@ import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { listRetainedAccounts, loadAccount, saveAccount } from "../src/weixin/accounts.js";
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 
-function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean; llmWiki?: object } = {}) {
+function setup(t: test.TestContext, options: {
+  taskboardClient?: object;
+  taskCards?: boolean;
+  llmWiki?: object;
+  onChannelSend?: (input: { accountId: string; toUserId: string; text: string }) => void;
+} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(root);
@@ -32,6 +37,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   }
   const starts: string[] = [];
   const inboundHandlers = new Map<string, (message: NormalizedWeixinMessage) => Promise<void>>();
+  const messageErrorHandlers = new Map<string, (error: unknown, message: NormalizedWeixinMessage) => Promise<void> | void>();
   const handledMessages: NormalizedWeixinMessage[] = [];
   const sent: Array<{ accountId: string; toUserId: string; text: string }> = [];
   const sentCards: Array<{ accountId: string; toUserId: string; card: { identifier: string; latestComment?: string; actions: readonly { label: string }[] } }> = [];
@@ -97,13 +103,15 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     channelFactory: (account) => ({
       client: {
         async sendText(input: { toUserId: string; text: string }) {
+          options.onChannelSend?.({ accountId: account.accountId, ...input });
           sent.push({ accountId: account.accountId, ...input });
           return { messageId: "sent" };
         }
       },
-      async monitor({ signal, onMessage }) {
+      async monitor({ signal, onMessage, onMessageError }) {
         starts.push(account.accountId);
         inboundHandlers.set(account.accountId, onMessage);
+        if (onMessageError) messageErrorHandlers.set(account.accountId, onMessageError);
         await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
       }
     }),
@@ -157,6 +165,11 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
       const handler = inboundHandlers.get(accountId);
       assert.ok(handler, `Inbound handler is not running for ${accountId}`);
       await handler(message);
+    },
+    async emitMessageError(accountId: string, error: unknown, message: NormalizedWeixinMessage) {
+      const handler = messageErrorHandlers.get(accountId);
+      assert.ok(handler, `Message error handler is not running for ${accountId}`);
+      await handler(error, message);
     },
     async emitCodexCompletion(completion: CodexSessionCompletion) {
       assert.ok(externalCompletionHandler, "Codex session monitor should be active");
@@ -335,6 +348,41 @@ test("adds redacted enterprise channels and stops them cleanly", async (t) => {
   assert.equal(feishu.channel, "feishu");
   assert.equal("appSecret" in feishu, false);
   await manager.stopAccount(wecom.accountId, false);
+  await manager.stopAccount(feishu.accountId, false);
+});
+
+test("logs Feishu message errors locally before sending a redacted group reply", async (t) => {
+  const privateDetail = "fixture private string that must stay local";
+  const expectedLog = ["[codex-channel-bridge] feishu message handling failed", privateDetail];
+  const loggedErrors: unknown[][] = [];
+  const { manager, sent, emitMessageError } = setup(t, {
+    onChannelSend: () => assert.deepEqual(loggedErrors, [expectedLog])
+  });
+  t.mock.method(console, "error", (...args: unknown[]) => {
+    loggedErrors.push(args);
+  });
+
+  const feishu = await manager.addChannelAccount({
+    channel: "feishu",
+    appId: "cli_error_test",
+    appSecret: "feishu-secret"
+  });
+  await emitMessageError(feishu.accountId, new Error(privateDetail), {
+    id: "feishu-error-1",
+    senderId: "ou_release_owner",
+    replyTargetId: "oc_release_room",
+    text: "",
+    attachments: [],
+    raw: { channel: "feishu", event: {} }
+  });
+
+  assert.deepEqual(loggedErrors, [expectedLog]);
+  assert.deepEqual(sent, [{
+    accountId: feishu.accountId,
+    toUserId: "oc_release_room",
+    text: "[codex-channel-bridge] 本轮消息处理失败，详细错误已写入本机服务输出。"
+  }]);
+  assert.ok(!sent[0]?.text.includes(privateDetail));
   await manager.stopAccount(feishu.accountId, false);
 });
 

@@ -1243,6 +1243,7 @@ test("binds a Codex Desktop session from the current project and continues its t
   stateStore.createSession("alice@im.wechat", project.workspace, "桥接会话", project.id);
   const replies: string[] = [];
   const runs: Array<{ threadId?: string; queueKey?: string }> = [];
+  let forkThread = false;
   const service = new BridgeService({
     config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
     stateStore,
@@ -1260,8 +1261,19 @@ test("binds a Codex Desktop session from the current project and continues its t
       }
     } as never,
     runner: {
-      async run(input: { threadId?: string; queueKey?: string }) {
+      async run(input: {
+        threadId?: string;
+        queueKey?: string;
+        getBoundThreadId(): string | undefined;
+        onThreadForked(threadId: string): void;
+      }) {
         runs.push(input);
+        assert.equal(input.getBoundThreadId(), "desktop-thread");
+        if (forkThread) {
+          input.onThreadForked("bridge-fork");
+          assert.equal(input.getBoundThreadId(), "bridge-fork");
+          throw new Error("fixture turn failed after forking");
+        }
         return { raw: "", text: "已继续", threadId: input.threadId };
       },
       async stop() {}
@@ -1284,7 +1296,12 @@ test("binds a Codex Desktop session from the current project and continues its t
 
   await send("continue", "接着完成");
   assert.equal(runs.at(-1)?.threadId, "desktop-thread");
-  assert.equal(runs.at(-1)?.queueKey, "desktop-thread");
+  assert.equal(runs.at(-1)?.queueKey, stateStore.getActiveSession("alice@im.wechat")?.id);
+
+  forkThread = true;
+  await assert.rejects(send("continue-fork", "继续本轮"), /fixture turn failed/);
+  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.threadId, "bridge-fork");
+  assert.match(replies.at(-1) ?? "", /保留历史的独立会话/);
 });
 
 test("authorized WeChat can add, list, and switch Codex projects", async (t) => {

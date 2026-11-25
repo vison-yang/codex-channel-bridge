@@ -35,6 +35,8 @@ export type CodexRunnerInput = {
   cwd: string;
   threadId?: string;
   queueKey?: string;
+  getBoundThreadId?: () => string | undefined; // 托管会话入队后读取当前持久化绑定。
+  onThreadForked?: (threadId: string) => void; // 在启动新轮次前同步持久化副本绑定。
   turnTimeoutMs?: number;
   model?: string;
   effort?: string;
@@ -125,6 +127,7 @@ type JsonRpcId = number | string;
 
 type PendingRequest = {
   method: string;
+  threadId?: string;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
@@ -203,6 +206,27 @@ type WireMessage = {
   };
 };
 
+class AppServerRequestError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: number | undefined,
+    readonly rpcMessage: string | undefined,
+    readonly threadId?: string,
+    options?: ErrorOptions
+  ) {
+    const codeSuffix = code === undefined ? "" : ` (${code})`;
+    super(`app-server ${method} failed${codeSuffix}: ${rpcMessage ?? "unknown error"}`, options);
+  }
+}
+
+export function isThreadWriterConflictError(error: unknown): error is AppServerRequestError {
+  return error instanceof AppServerRequestError
+    && error.method === "thread/resume"
+    && error.code === -32600
+    && Boolean(error.threadId)
+    && error.rpcMessage === `thread ${error.threadId} already has an active writer`;
+}
+
 // 只有携带轮次标识的工作通知能刷新执行计时。
 const turnActivityMethods = new Set([
   "item/started",
@@ -259,19 +283,7 @@ export class AppServerCodexRunner {
     }
 
     const approvalPolicy = input.ephemeral ? "never" : this.options.approvalPolicy;
-    const threadResponse = await this.request(
-      input.threadId ? "thread/resume" : "thread/start",
-      compactObject({
-        ...(input.threadId ? { threadId: input.threadId } : {}),
-        ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
-        cwd: input.cwd,
-        model: input.model,
-        // 默认由 Codex 按 cwd 解析项目权限，内部分类固定为只读且不发起审批。
-        approvalPolicy,
-        sandbox: input.ephemeral ? input.sandbox : undefined,
-        ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
-      })
-    ) as Record<string, unknown>;
+    const threadResponse = await this.openThread(input, approvalPolicy);
     const thread = threadResponse.thread as Record<string, unknown> | undefined;
     const threadId = typeof thread?.id === "string" ? thread.id : input.threadId;
     if (!threadId) {
@@ -325,7 +337,7 @@ export class AppServerCodexRunner {
       }
       try {
         await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
-        await this.waitForThreadIdle(input.threadId);
+        await this.waitForThreadIdle(threadId);
         started = await this.startTurn(threadId, turnParams, input);
       } catch (retryError) {
         this.dynamicToolHandlersByThread.delete(threadId);
@@ -546,6 +558,55 @@ export class AppServerCodexRunner {
     }
   }
 
+  private async openThread(input: CodexRunnerInput, approvalPolicy?: CodexApprovalPolicy): Promise<Record<string, unknown>> {
+    const { threadId, onThreadForked } = input;
+    const params = compactObject({
+      cwd: input.cwd,
+      model: input.model,
+      // 默认由 Codex 按 cwd 解析项目权限，内部分类固定为只读且不发起审批。
+      approvalPolicy,
+      sandbox: input.ephemeral ? input.sandbox : undefined
+    });
+    if (!threadId) {
+      return await this.request("thread/start", {
+        ...params,
+        ...compactObject({ ephemeral: input.ephemeral, dynamicTools: input.dynamicTools })
+      }) as Record<string, unknown>;
+    }
+
+    try {
+      return await this.request("thread/resume", { ...params, threadId }) as Record<string, unknown>;
+    } catch (error) {
+      if (!onThreadForked || input.ephemeral || !isThreadWriterConflictError(error)) throw error;
+
+      let response: Record<string, unknown>;
+      let forkedThreadId: string;
+      try {
+        // 恢复请求与读取之间源会话可能开始新轮次，分叉只复制到重新确认的终止轮次。
+        const lastTurnId = await this.waitForThreadIdle(threadId, input.onProgress);
+        response = await this.request("thread/fork", compactObject({
+          ...params,
+          threadId,
+          lastTurnId,
+          excludeTurns: true,
+          deferGoalContinuation: true
+        })) as Record<string, unknown>;
+        const forkedThread = response?.thread as Record<string, unknown> | undefined;
+        if (typeof forkedThread?.id !== "string" || !forkedThread.id || forkedThread.id === threadId) {
+          throw new Error("Codex app-server did not return a distinct forked thread id");
+        }
+        forkedThreadId = forkedThread.id;
+      } catch (cause) {
+        if (cause instanceof CodexRunError) throw cause;
+        throw new AppServerRequestError(error.method, error.code, error.rpcMessage, error.threadId, { cause });
+      }
+
+      // 先持久化绑定，轮次失败后重试时仍可使用同一副本。
+      onThreadForked(forkedThreadId);
+      return response;
+    }
+  }
+
   private async startTurn(
     threadId: string,
     params: Record<string, unknown>,
@@ -609,7 +670,8 @@ export class AppServerCodexRunner {
         reject(error);
         this.failTransport(new Error(error.message, { cause: error }), true);
       }, timeoutMs);
-      this.pending.set(id, { method, resolve, reject, timer });
+      const threadId = method === "thread/resume" && typeof params.threadId === "string" ? params.threadId : undefined;
+      this.pending.set(id, { method, threadId, resolve, reject, timer });
       try {
         this.send({ id, method, params });
       } catch (error) {
@@ -670,8 +732,7 @@ export class AppServerCodexRunner {
     this.pending.delete(message.id);
     clearTimeout(pending.timer);
     if (message.error) {
-      const code = message.error.code === undefined ? "" : ` (${message.error.code})`;
-      pending.reject(new Error(`app-server ${pending.method} failed${code}: ${message.error.message ?? "unknown error"}`));
+      pending.reject(new AppServerRequestError(pending.method, message.error.code, message.error.message, pending.threadId));
     } else {
       pending.resolve(message.result);
     }
@@ -824,22 +885,23 @@ export class AppServerCodexRunner {
   private async waitForThreadIdle(
     threadId: string,
     onProgress?: (message: string) => Promise<void> | void
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_CODEX_REQUEST_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
     let notified = false;
     while (true) {
       const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
       const thread = response.thread as Record<string, unknown> | undefined;
-      const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-      const busy = turns.slice(-1).some((value) => {
-        const turn = value as Record<string, unknown>;
-        const status = typeof turn.status === "string"
-          ? turn.status.replace(/[_\s-]/g, "").toLowerCase()
-          : "";
-        return status === "inprogress" || status === "running" || status === "started";
-      });
-      if (!busy) return;
+      const latestTurn = Array.isArray(thread?.turns) ? thread.turns.at(-1) as Record<string, unknown> | undefined : undefined;
+      const status = typeof latestTurn?.status === "string"
+        ? latestTurn.status.replace(/[_\s-]/g, "").toLowerCase()
+        : "";
+      const runtimeStatus = thread?.status as { type?: unknown } | undefined;
+      const busy = runtimeStatus?.type === "active" || status === "inprogress" || status === "running" || status === "started";
+      if (!busy) {
+        const canForkAtTurn = status === "completed" || status === "failed" || status === "interrupted";
+        return canForkAtTurn && typeof latestTurn?.id === "string" ? latestTurn.id : undefined;
+      }
       if (!notified) {
         notified = true;
         await onProgress?.("当前会话的上一条任务仍在执行，已排队等待完成。");

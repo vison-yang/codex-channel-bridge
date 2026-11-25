@@ -625,6 +625,240 @@ test("serializes concurrent turns for the same managed session", async (t) => {
   assert.deepEqual(lifecycleOrder, ["start:first", "finish:first", "start:second", "finish:second"]);
 });
 
+test("forks a managed writer-conflicted thread once and reuses it for queued turns", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "auto",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  let boundThreadId = "thread-writer-conflict";
+  const forked: string[] = [];
+  const lifecycle: string[] = [];
+  const common = {
+    cwd: "/tmp/writer-conflict-project",
+    threadId: boundThreadId,
+    queueKey: "managed-session",
+    onApproval: () => "decline" as const,
+    getBoundThreadId: () => boundThreadId,
+    onThreadForked: (threadId: string) => {
+      forked.push(threadId);
+      boundThreadId = threadId;
+      lifecycle.push("bound");
+    }
+  };
+  const first = runner.run({
+    ...common,
+    prompt: "first after conflict",
+    onExecutionStarted: () => {
+      assert.equal(boundThreadId, "thread-writer-fork-1");
+      lifecycle.push("started:first");
+    }
+  }).then((result) => { lifecycle.push("finished:first"); return result; });
+  const second = runner.run({
+    ...common,
+    prompt: "second after conflict",
+    onExecutionStarted: () => {
+      assert.equal(boundThreadId, "thread-writer-fork-1");
+      lifecycle.push("started:second");
+    }
+  }).then((result) => { lifecycle.push("finished:second"); return result; });
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.deepEqual(forked, ["thread-writer-fork-1"]);
+  assert.equal(firstResult.threadId, boundThreadId);
+  assert.equal(secondResult.threadId, boundThreadId);
+  assert.equal(firstResult.text, "reply:first after conflict");
+  assert.equal(secondResult.text, "reply:second after conflict");
+  assert.deepEqual(lifecycle, ["bound", "started:first", "finished:first", "started:second", "finished:second"]);
+
+  const history = await runner.getHistory(boundThreadId);
+  assert.deepEqual(history.filter((message) => message.role === "user").map((message) => message.text), [
+    "hello history", "first after conflict", "second after conflict"
+  ]);
+});
+
+test("does not start the forked turn if binding the replacement thread fails", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  await assert.rejects(runner.run({
+    cwd: "/tmp/writer-conflict-project",
+    prompt: "must not execute",
+    threadId: "thread-writer-conflict",
+    queueKey: "managed-session",
+    getBoundThreadId: () => "thread-writer-conflict",
+    onThreadForked: () => { throw new Error("cannot persist replacement thread"); }
+  }), /cannot persist replacement thread/);
+
+  const history = await runner.getHistory("thread-writer-fork-1");
+  assert.equal(history.some((message) => message.text === "must not execute"), false);
+});
+
+test("waits for an active turn before recovering its writer-conflicted thread", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const events: string[] = [];
+  let boundThreadId = "thread-writer-busy";
+  const result = await runner.run({
+    cwd: "/tmp/writer-conflict-project",
+    prompt: "after active turn",
+    threadId: boundThreadId,
+    queueKey: "managed-session",
+    getBoundThreadId: () => boundThreadId,
+    onThreadForked: (threadId) => { boundThreadId = threadId; events.push("bound"); },
+    onExecutionStarted: () => events.push("started"),
+    onProgress: (message) => events.push(message)
+  });
+  assert.equal(result.threadId, "thread-writer-fork-1");
+  assert.deepEqual(events, [
+    "当前会话的上一条任务仍在执行，已排队等待完成。",
+    "bound",
+    "started",
+    "working:after active turn"
+  ]);
+});
+
+test("rechecks for an external turn that starts while a resume is being attempted", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  let boundThreadId = "thread-writer-race";
+  const progress: string[] = [];
+  const result = await runner.run({
+    cwd: "/tmp/writer-conflict-project",
+    prompt: "after raced turn",
+    threadId: boundThreadId,
+    queueKey: "managed-session",
+    getBoundThreadId: () => boundThreadId,
+    onThreadForked: (threadId) => { boundThreadId = threadId; },
+    onProgress: (message) => progress.push(message)
+  });
+  assert.equal(result.threadId, "thread-writer-fork-1");
+  assert.equal(progress[0], "当前会话的上一条任务仍在执行，已排队等待完成。");
+});
+
+test("stops a forked managed turn using its original thread and stable session key", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  let boundThreadId = "thread-writer-conflict";
+  let notifyStarted!: () => void;
+  const started = new Promise<void>((resolve) => { notifyStarted = resolve; });
+  const running = runner.run({
+    cwd: "/tmp/writer-conflict-project",
+    prompt: "hold",
+    threadId: boundThreadId,
+    queueKey: "managed-session",
+    getBoundThreadId: () => boundThreadId,
+    onThreadForked: (threadId) => { boundThreadId = threadId; },
+    onExecutionStarted: notifyStarted
+  });
+  const interrupted = assert.rejects(running, /interrupted/i);
+  await Promise.race([started, running.then(() => { throw new Error("turn completed before stop"); })]);
+  assert.equal(boundThreadId, "thread-writer-fork-1");
+  await runner.stop("thread-writer-conflict", "managed-session");
+  await interrupted;
+});
+
+test("retains the writer conflict if forking fails and does not rebind the session", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "auto",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  let boundThreadId = "thread-writer-fork-denied";
+  await assert.rejects(runner.run({
+    cwd: "/tmp/writer-conflict-project",
+    prompt: "must not execute",
+    threadId: boundThreadId,
+    queueKey: "managed-session",
+    getBoundThreadId: () => boundThreadId,
+    onThreadForked: (threadId) => { boundThreadId = threadId; }
+  }), (error: Error) => {
+    assert.equal(error.message, "app-server thread/resume failed (-32600): thread thread-writer-fork-denied already has an active writer");
+    assert.match(String(error.cause), /thread\/fork failed.*fork denied by fixture/);
+    return true;
+  });
+  assert.equal(boundThreadId, "thread-writer-fork-denied");
+});
+
+test("retains explicitly configured approval and sandbox policies on a writer fork", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000,
+    approvalPolicy: "on-request",
+    execSandbox: "workspace-write"
+  });
+  t.after(() => runner.close());
+
+  let boundThreadId = "thread-writer-explicit";
+  const result = await runner.run({
+    cwd: "/tmp/writer-explicit-project",
+    prompt: "fork-explicit-policy",
+    threadId: boundThreadId,
+    queueKey: "managed-session",
+    getBoundThreadId: () => boundThreadId,
+    onThreadForked: (threadId) => { boundThreadId = threadId; }
+  });
+  assert.equal(result.threadId, "thread-writer-fork-1");
+  assert.equal(result.text, "reply:fork-explicit-policy");
+});
+
+test("does not fork unmanaged or unrelated thread resume failures", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const forked: string[] = [];
+  const managed = (threadId: string) => ({
+    getBoundThreadId: () => threadId,
+    onThreadForked: (replacement: string) => forked.push(replacement)
+  });
+  for (const [threadId, options, expectedCode, expectedMessage] of [
+    ["thread-writer-conflict", {}, -32600, "thread thread-writer-conflict already has an active writer"],
+    ["thread-resume-missing", managed("thread-resume-missing"), -32600, "thread thread-resume-missing not found"],
+    ["thread-resume-other-code", managed("thread-resume-other-code"), -32602, "thread thread-resume-other-code already has an active writer"],
+    ["thread-resume-other-writer", managed("thread-resume-other-writer"), -32600, "thread some-other-thread already has an active writer"]
+  ] as const) {
+    await assert.rejects(runner.run({
+      ...options,
+      cwd: "/tmp/writer-conflict-project",
+      prompt: "must reject",
+      threadId,
+      queueKey: threadId
+    }), (error: Error) => {
+      assert.equal(error.message, `app-server thread/resume failed (${expectedCode}): ${expectedMessage}`);
+      return true;
+    });
+  }
+  assert.deepEqual(forked, []);
+});
+
 test("waits for an existing thread turn before continuing it", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),

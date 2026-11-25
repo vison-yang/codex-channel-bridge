@@ -1,9 +1,13 @@
+import { isThreadWriterConflictError } from "../codex/app-server-runner.js";
 import { codexFailureOutcome } from "../codex/run-lifecycle.js";
 
 export function userFacingMessageHandlingError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (message.trim() === "workspace routing discovery timed out") {
     return "[codex-channel-bridge] Codex 查询 ChatGPT 工作区路由超时。请检查运行桥接服务的机器能否通过当前网络或代理连接 ChatGPT，再重试。";
+  }
+  if (isThreadWriterConflictError(error)) {
+    return "[codex-channel-bridge] 另一个 Codex 客户端正在占用此会话。请在原客户端关闭该会话后重试，或切换到其他会话。";
   }
   if (/CreateProcessAsUserW failed:\s*1312|codexExecSandbox/i.test(message)) {
     return [

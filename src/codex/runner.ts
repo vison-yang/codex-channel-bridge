@@ -1,5 +1,6 @@
 import {
   AppServerCodexRunner,
+  isThreadWriterConflictError,
   type CodexHistoryMessage,
   type CodexModelOption,
   type CodexRunnerInput,
@@ -38,6 +39,7 @@ export class HybridCodexRunner {
   private readonly appServer: AppServerCodexRunner;
   private readonly exec: CodexExecRunner;
   private readonly runTails = new Map<string, Promise<void>>();
+  private readonly sessionRunTails = new Map<string, Promise<void>>();
 
   constructor(private readonly options: HybridCodexRunnerOptions) {
     const turnTimeoutMs = options.turnTimeoutMs ?? options.timeoutMs ?? DEFAULT_CODEX_TURN_TIMEOUT_MS;
@@ -56,27 +58,66 @@ export class HybridCodexRunner {
     });
   }
 
-  async run(input: CodexRunnerInput): Promise<CodexRunResult> {
-    const queueKey = input.queueKey ?? input.threadId;
-    if (!queueKey) return this.runImmediately(input);
+  run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    const getBoundThreadId = input.getBoundThreadId;
+    if (!getBoundThreadId) {
+      return this.runQueued(this.runTails, input.queueKey ?? input.threadId, input.onProgress, () => this.runImmediately(input));
+    }
+    // 先进入托管会话的队列，再读取上一个请求可能已更新的绑定。
+    return this.runQueued(this.sessionRunTails, input.queueKey, input.onProgress, () => {
+      const threadId = getBoundThreadId();
+      return this.runQueued(this.runTails, threadId, input.onProgress, (tail) => {
+        return this.runManagedThread({ ...input, threadId }, tail);
+      });
+    });
+  }
 
-    const predecessor = this.runTails.get(queueKey);
+  private async runManagedThread(input: CodexRunnerInput, tail?: Promise<void>): Promise<CodexRunResult> {
+    const onThreadForked = input.onThreadForked;
+    if (!tail || !onThreadForked) return this.runImmediately(input);
+
+    let forkedThreadId: string | undefined;
+    try {
+      return await this.runImmediately({
+        ...input,
+        onThreadForked: (threadId) => {
+          if (this.runTails.has(threadId)) throw new Error("Codex fork returned a thread id already queued");
+          // 在公开新绑定之前占住新线程的队列，避免另一会话交错启动轮次。
+          this.runTails.set(threadId, tail);
+          forkedThreadId = threadId;
+          onThreadForked(threadId);
+        }
+      });
+    } finally {
+      if (forkedThreadId && this.runTails.get(forkedThreadId) === tail) this.runTails.delete(forkedThreadId);
+    }
+  }
+
+  private async runQueued(
+    tails: Map<string, Promise<void>>,
+    queueKey: string | undefined,
+    onProgress: CodexRunnerInput["onProgress"],
+    run: (tail?: Promise<void>) => Promise<CodexRunResult>
+  ): Promise<CodexRunResult> {
+    if (!queueKey) return run();
+
+    const predecessor = tails.get(queueKey);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const tail = (predecessor ?? Promise.resolve()).catch(() => undefined).then(() => gate);
-    this.runTails.set(queueKey, tail);
+    tails.set(queueKey, tail);
     try {
       if (predecessor) {
-        await input.onProgress?.("当前会话的上一条消息仍在处理中，已加入队列。");
+        await onProgress?.("当前会话的上一条消息仍在处理中，已加入队列。");
         await predecessor.catch(() => undefined);
       }
-      return await this.runImmediately(input);
+      return await run(tail);
     } finally {
       release();
-      if (this.runTails.get(queueKey) === tail) {
-        this.runTails.delete(queueKey);
+      if (tails.get(queueKey) === tail) {
+        tails.delete(queueKey);
       }
     }
   }
@@ -87,16 +128,23 @@ export class HybridCodexRunner {
       return this.exec.run(input);
     }
     let hasStarted = false;
+    let hasForked = false;
+    const onThreadForked = input.onThreadForked;
     try {
       return await this.appServer.run({
         ...input,
+        onThreadForked: onThreadForked && ((threadId) => {
+          hasForked = true;
+          onThreadForked(threadId);
+        }),
         onExecutionStarted: () => {
           hasStarted = true;
           input.onExecutionStarted?.();
         }
       });
     } catch (error) {
-      if (this.options.backend === "app-server" || input.onApproval || codexFailureOutcome(error) !== "failed") {
+      if (this.options.backend === "app-server" || input.onApproval || hasForked || codexFailureOutcome(error) !== "failed"
+        || ((input.getBoundThreadId || onThreadForked) && isThreadWriterConflictError(error))) {
         throw error;
       }
       const fallback = await this.exec.run({
@@ -113,9 +161,11 @@ export class HybridCodexRunner {
   }
 
   async stop(threadId?: string, queueKey?: string): Promise<void> {
+    // 托管请求的活动轮次可能已经转到副本，按请求进入时的会话标识查找。
+    const targetThreadId = queueKey && this.sessionRunTails.has(queueKey) ? undefined : threadId;
     await Promise.all([
-      this.appServer.stop(threadId, queueKey),
-      this.exec.stop(threadId, queueKey)
+      this.appServer.stop(targetThreadId, queueKey),
+      this.exec.stop(targetThreadId, queueKey)
     ]);
   }
 
