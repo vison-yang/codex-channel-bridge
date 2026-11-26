@@ -38,6 +38,7 @@ export type CodexWeixinConfig = {
   feishuReactions: boolean;
   feishuProgressCards: boolean;
   feishuStreamingReplies: boolean;
+  channelChatIntentClassification: boolean;
   maxBufferItems: number;
   promptBufferTtlMs: number;
   maxInboundBytes: number;
@@ -57,6 +58,7 @@ export function defaultConfig(cwd = path.join(os.homedir(), ".codex-weixin")): C
     feishuReactions: true,
     feishuProgressCards: true,
     feishuStreamingReplies: false,
+    channelChatIntentClassification: false,
     maxBufferItems: 50,
     promptBufferTtlMs: 10 * 60_000,
     maxInboundBytes: MAX_INBOUND_BYTES,
@@ -78,6 +80,9 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexWeixinConfig {
     feishuReactions: typeof loaded.feishuReactions === "boolean" ? loaded.feishuReactions : base.feishuReactions,
     feishuProgressCards: typeof loaded.feishuProgressCards === "boolean" ? loaded.feishuProgressCards : base.feishuProgressCards,
     feishuStreamingReplies: typeof loaded.feishuStreamingReplies === "boolean" ? loaded.feishuStreamingReplies : base.feishuStreamingReplies,
+    channelChatIntentClassification: typeof loaded.channelChatIntentClassification === "boolean"
+      ? loaded.channelChatIntentClassification
+      : base.channelChatIntentClassification,
     taskboardEnabled: typeof loaded.taskboardEnabled === "boolean" ? loaded.taskboardEnabled : base.taskboardEnabled,
     taskboardUrl: typeof loaded.taskboardUrl === "string" && loaded.taskboardUrl.trim()
       ? loaded.taskboardUrl.trim()

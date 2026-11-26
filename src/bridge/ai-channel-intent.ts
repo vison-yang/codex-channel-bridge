@@ -32,6 +32,7 @@ type CodexChannelIntentResolverOptions = {
   readonly runner: HybridCodexRunner;
   readonly cwd: string;
   readonly model?: string;
+  readonly channelChatIntentClassification?: boolean;
 };
 
 export class AiChannelIntentResolver implements ChannelIntentResolver {
@@ -55,7 +56,7 @@ export class AiChannelIntentResolver implements ChannelIntentResolver {
 export function createCodexChannelIntentResolver(
   options: CodexChannelIntentResolverOptions
 ): ChannelIntentResolver {
-  return new AiChannelIntentResolver(async (prompt, outputSchema) => {
+  const resolver = new AiChannelIntentResolver(async (prompt, outputSchema) => {
     const result = await options.runner.runEphemeral({
       prompt,
       cwd: options.cwd,
@@ -65,6 +66,13 @@ export function createCodexChannelIntentResolver(
     });
     return result.text;
   });
+  return {
+    async resolve(input) {
+      // 任务模式保留自然语言任务操作；普通会话和问答直接进入正式轮次。
+      if (!options.channelChatIntentClassification && input.currentMode !== "task") return undefined;
+      return resolver.resolve(input);
+    }
+  };
 }
 
 function buildClassifierPrompt(input: ChannelIntentResolverInput): string {

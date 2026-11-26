@@ -298,11 +298,15 @@ export class BridgeService {
   ): Promise<FriendlyChannelIntent | undefined> {
     const resolver = this.options.intentResolver;
     if (!resolver || !text.trim()) return undefined;
-    const projects = this.options.stateStore.listProjects();
+    const { stateStore } = this.options;
+    const projects = stateStore.listProjects();
     const activeProject = this.currentProject(conversationId);
     const knowledgeBaseName = activeProject ? this.resolveQaContext(activeProject)?.name : undefined;
     const currentProjectName = activeProject?.name;
-    const currentMode = this.options.stateStore.getInteractionMode(conversationId);
+    const storedMode = stateStore.getInteractionMode(conversationId);
+    const currentMode = stateStore.getActiveProject(conversationId) && this.modeSettings.enabledModes.includes(storedMode)
+      ? storedMode
+      : this.modeSettings.defaultMode;
     try {
       return await resolver.resolve({
         text,

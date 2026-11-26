@@ -13,7 +13,7 @@ import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from ".
 import { feishuActionCard } from "./feishu-action-card.js";
 import { cardActionIdentity, formValueFromRawCardAction } from "./feishu-card-action.js";
 import { FeishuCardUpdater } from "./feishu-card-updater.js";
-import { checkFeishuResponse, FeishuFeedbackApi } from "./feishu-feedback-api.js";
+import { checkFeishuResponse, FeishuFeedbackApi, feishuGetTiming, measureFeishuGetHttp } from "./feishu-feedback-api.js";
 import { FeishuMessageFeedback, type FeishuReactions } from "./feishu-message-feedback.js";
 import { FeishuProgressCard } from "./feishu-progress-card.js";
 import { FeishuStreamReply, type FeishuCardKit } from "./feishu-stream-reply.js";
@@ -56,7 +56,17 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
 
   constructor(account: FeishuAccount, options: FeishuAdapterOptions = {}) {
     const config = { appId: account.appId, appSecret: account.appSecret };
-    this.apiClient = options.apiClient ?? new Lark.Client({ ...config, httpInstance: feishuHttpInstance() });
+    this.apiClient = options.apiClient ?? new Lark.Client({
+      ...config,
+      httpInstance: feishuHttpInstance(),
+      logger: {
+        ...Lark.defaultLogger,
+        error: (...args: unknown[]) => {
+          // The SDK can log raw Axios errors with credentials; Get logs its own result.
+          if (!feishuGetTiming.getStore()) Lark.defaultLogger.error(...args);
+        }
+      }
+    });
     this.wsClient = options.wsClient ?? new Lark.WSClient(config);
     this.cardUpdater = new FeishuCardUpdater(this.apiClient.im.v1.message.patch);
     this.inboundDir = options.inboundDir;
@@ -298,14 +308,29 @@ function sentMessage(result: { code?: number; data?: { message_id?: string } }):
 function feishuHttpInstance(): Lark.HttpInstance {
   // The SDK default Axios interceptor unwraps the HTTP response to the API body.
   const http = Lark.defaultHttpInstance as unknown as Lark.HttpInstance;
+  const tenantTokenUrl = /\/auth\/v3\/tenant_access_token\//;
   return {
     ...http,
     request: (options) => {
       const url = options.url ?? "";
-      const feedback = /\/reactions(?:\/|$)|\/cardkit\/v1\/|\/auth\/v3\/tenant_access_token\//.test(url)
+      const isReaction = /\/reactions(?:\/|$)/.test(url);
+      const isTenantToken = tenantTokenUrl.test(url);
+      const feedback = isReaction || isTenantToken || /\/cardkit\/v1\//.test(url)
         || /\/im\/v1\/messages\/[^/]+\/reply$/.test(url)
         || (options.method === "PATCH" && /\/im\/v1\/messages\/[^/]+$/.test(url));
-      return http.request(feedback ? { ...options, timeout: 2_500 } : options);
+      const requestOptions = feedback ? { ...options, timeout: 2_500 } : options;
+      const timing = feishuGetTiming.getStore();
+      if (timing && isReaction) return measureFeishuGetHttp(timing, "reactionMs", () => http.request(requestOptions));
+      if (timing && isTenantToken) return measureFeishuGetHttp(timing, "tokenMs", () => http.request(requestOptions));
+      return http.request(requestOptions);
+    },
+    post: (url, data, options) => {
+      // The SDK's bound Axios post bypasses the request wrapper above.
+      const timing = feishuGetTiming.getStore();
+      if (timing && tenantTokenUrl.test(url)) {
+        return measureFeishuGetHttp(timing, "tokenMs", () => http.post(url, data, options));
+      }
+      return http.post(url, data, options);
     }
   };
 }

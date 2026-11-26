@@ -19,10 +19,31 @@ test("uses ~/.codex-weixin as the default Codex workspace", () => {
   assert.equal(defaultConfig().defaultCwd, path.join(os.homedir(), ".codex-weixin"));
   assert.deepEqual(defaultConfig().allowedWorkspaces, [path.join(os.homedir(), ".codex-weixin")]);
   assert.equal(defaultConfig().streamReplies, true);
+  assert.equal(defaultConfig().channelChatIntentClassification, false);
   assert.equal(defaultConfig().maxInboundBytes, 100 * 1024 * 1024);
   assert.equal(defaultConfig().taskboardEnabled, true);
   assert.equal(defaultConfig().taskboardUrl, "http://127.0.0.1:47823");
   assert.equal(resolveStatePaths("/tmp/codex-weixin-test").taskboardDir, "/tmp/codex-weixin-test/taskboard");
+});
+
+test("defaults old configurations to the chat fast path and preserves an explicit opt-in", (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "channel-intent-config-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const paths = resolveStatePaths(stateDir);
+
+  fs.writeFileSync(paths.configPath, JSON.stringify({ streamReplies: false }));
+  const legacy = loadConfig(paths, "/tmp/project");
+  assert.equal(legacy.channelChatIntentClassification, false);
+  assert.equal(legacy.streamReplies, false);
+
+  saveConfig(paths, { ...legacy, channelChatIntentClassification: true });
+  assert.equal(JSON.parse(fs.readFileSync(paths.configPath, "utf8")).channelChatIntentClassification, true);
+  assert.equal(loadConfig(paths).channelChatIntentClassification, true);
+
+  saveConfig(paths, { ...loadConfig(paths), channelChatIntentClassification: false });
+  assert.equal(loadConfig(paths).channelChatIntentClassification, false);
+  fs.writeFileSync(paths.configPath, JSON.stringify({ channelChatIntentClassification: "true" }));
+  assert.equal(loadConfig(paths).channelChatIntentClassification, false);
 });
 
 test("migrates the legacy inbound limit and never exceeds 100 MiB", (t) => {

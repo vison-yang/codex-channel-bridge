@@ -4,7 +4,7 @@ import type * as Lark from "@larksuiteoapi/node-sdk";
 
 import type { CodexActivityEvent } from "../codex/activity.js";
 import type { ChannelMessageFeedback, ChannelTaskOutcome } from "./types.js";
-import { FeishuFeedbackApi } from "./feishu-feedback-api.js";
+import { FeishuFeedbackApi, feishuGetTiming } from "./feishu-feedback-api.js";
 import type { FeishuProgressCard } from "./feishu-progress-card.js";
 import type { FeishuStreamReply } from "./feishu-stream-reply.js";
 
@@ -15,7 +15,7 @@ type ReactionEmoji = "Get" | "Typing" | typeof outcomeEmoji[ChannelTaskOutcome];
 
 export class FeishuMessageFeedback implements ChannelMessageFeedback {
   readonly activity?: (event: CodexActivityEvent) => void;
-  private readonly received?: Promise<string | undefined>;
+  private readonly received?: Promise<void>;
   private typing?: Promise<string | undefined>;
   private terminal?: Promise<void>;
   private outcome?: ChannelTaskOutcome;
@@ -29,13 +29,7 @@ export class FeishuMessageFeedback implements ChannelMessageFeedback {
     private readonly streamReply?: FeishuStreamReply
   ) {
     if (progress) this.activity = (event) => progress.activity(event);
-    if (!reactions) return;
-    this.received = this.add("Get").then((reactionId) => {
-      if (reactionId) {
-        console.log(`[codex-channel-bridge] Feishu Get acknowledged in ${(performance.now() - receivedAt).toFixed(1)}ms`);
-      }
-      return reactionId;
-    });
+    if (reactions) this.received = this.acknowledge(receivedAt);
   }
 
   get stream(): FeishuStreamReply | undefined {
@@ -61,6 +55,20 @@ export class FeishuMessageFeedback implements ChannelMessageFeedback {
 
   async settled(): Promise<void> {
     await Promise.all([this.received, this.terminal, this.progress?.settled(), this.streamReply?.settled()]);
+  }
+
+  private async acknowledge(receivedAt: number): Promise<void> {
+    const localMs = performance.now() - receivedAt;
+    const timing = { attempts: 0, backoffMs: 0, tokenMs: 0, reactionMs: 0 };
+    const reactionId = await feishuGetTiming.run(timing, () => this.add("Get"));
+    const totalMs = (performance.now() - receivedAt).toFixed(1);
+    const segments = `localMs=${localMs.toFixed(1)} backoffMs=${timing.backoffMs.toFixed(1)} `
+      + `tokenMs=${timing.tokenMs.toFixed(1)} reactionMs=${timing.reactionMs.toFixed(1)} attempts=${timing.attempts}`;
+    if (reactionId) {
+      console.log(`[codex-channel-bridge] Feishu Get acknowledged in ${totalMs}ms (${segments})`);
+    } else {
+      console.warn(`[codex-channel-bridge] Feishu could not add Get reaction after ${totalMs}ms (${segments})`);
+    }
   }
 
   private async complete(outcome: ChannelTaskOutcome): Promise<void> {
@@ -90,7 +98,7 @@ export class FeishuMessageFeedback implements ChannelMessageFeedback {
       if (!response.data?.reaction_id) throw new Error("Feishu did not return a reaction_id");
       return response.data.reaction_id;
     } catch {
-      console.warn(`[codex-channel-bridge] Feishu could not add ${emoji} reaction`);
+      if (emoji !== "Get") console.warn(`[codex-channel-bridge] Feishu could not add ${emoji} reaction`);
       return undefined;
     }
   }

@@ -373,6 +373,7 @@ export class AccountManager {
       intentResolver: createCodexChannelIntentResolver({
         runner,
         cwd: this.options.paths.root,
+        channelChatIntentClassification: config.channelChatIntentClassification,
         ...(config.model ? { model: config.model } : {})
       }),
       listCodexModels: () => this.getCodexModels(),

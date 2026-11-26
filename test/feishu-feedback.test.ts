@@ -5,6 +5,8 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import test, { type TestContext } from "node:test";
 
+import * as Lark from "@larksuiteoapi/node-sdk";
+
 import { BridgeService } from "../src/bridge/service.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu.js";
 import type { FeishuCardKit } from "../src/channels/feishu-stream-reply.js";
@@ -38,6 +40,13 @@ async function waitFor(check: () => boolean, description: string): Promise<void>
     if (performance.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
+}
+
+function getTiming(line: string) {
+  const fields = /^\[codex-channel-bridge\] Feishu (?:Get acknowledged in|could not add Get reaction after) (\d+\.\d)ms \(localMs=(\d+\.\d) backoffMs=(\d+\.\d) tokenMs=(\d+\.\d) reactionMs=(\d+\.\d) attempts=(\d+)\)$/.exec(line);
+  assert.ok(fields, line);
+  const [totalMs, localMs, backoffMs, tokenMs, reactionMs, attempts] = fields.slice(1).map(Number);
+  return { totalMs, localMs, backoffMs, tokenMs, reactionMs, attempts };
 }
 
 function message(id: string, options: { actor?: string; chat?: string; image?: boolean; text?: string } = {}) {
@@ -273,6 +282,86 @@ test("acknowledges a direct message before classification and marks success only
   assert.deepEqual(fixture.errors, []);
 });
 
+test("measures Get token and reaction HTTP calls independently across concurrent messages", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
+  const warnings = t.mock.method(console, "warn", () => {});
+  const releaseCold = deferred<void>();
+  let tokenRequests = 0;
+  const post = t.mock.method(Lark.defaultHttpInstance, "post", async () => {
+    const attempt = ++tokenRequests;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    if (attempt === 1) throw new Error("private token error");
+    return { code: 0, tenant_access_token: "test-token", expire: 7200 };
+  });
+  const request = t.mock.method(Lark.defaultHttpInstance, "request", async ({ url }: { url?: string }) => {
+    if (url?.endsWith("/om_timing_cold/reactions")) {
+      await releaseCold.promise;
+      return { code: 0, data: { reaction_id: "reaction-cold" } };
+    }
+    assert.ok(url?.endsWith("/om_timing_cached/reactions"));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    throw new Error("private reaction error");
+  });
+  let dispatch: ((event: ReturnType<typeof message>) => Promise<unknown>) | undefined;
+  const adapter = new FeishuChannelAdapter({
+    channel: "feishu",
+    accountId: "feishu-transport-test",
+    appId: "cli_transport_test",
+    appSecret: "test-secret",
+    savedAt: "2026-11-25T00:00:00.000Z",
+    enabled: true
+  }, {
+    wsClient: {
+      async start({ eventDispatcher }) { dispatch = eventDispatcher.handles.get("im.message.receive_v1"); },
+      close() {}
+    }
+  });
+  const controller = new AbortController();
+  const monitor = adapter.monitor({
+    signal: controller.signal,
+    isMessageAllowed: () => true,
+    async onMessage() {}
+  });
+  t.after(async () => {
+    releaseCold.resolve();
+    controller.abort();
+    await monitor;
+  });
+  assert.ok(dispatch);
+
+  await dispatch(message("om_timing_auth_failure"));
+  await waitFor(() => warnings.mock.callCount() === 1, "token failure timing");
+  const failedToken = getTiming(warnings.mock.calls[0].arguments[0]);
+  assert.equal(failedToken.attempts, 1);
+  assert.ok(failedToken.tokenMs > 0);
+  assert.equal(failedToken.reactionMs, 0);
+  assert.equal(request.mock.callCount(), 0);
+
+  // The cold request has populated the SDK cache, but is still waiting on its reaction.
+  await dispatch(message("om_timing_cold"));
+  await waitFor(() => request.mock.callCount() === 1, "cold Get reaction request");
+  await dispatch(message("om_timing_cached"));
+  await waitFor(() => warnings.mock.callCount() === 2, "cached Get reaction failure timing");
+  const cached = getTiming(warnings.mock.calls[1].arguments[0]);
+  assert.equal(cached.attempts, 1);
+  assert.equal(cached.tokenMs, 0);
+  assert.ok(cached.reactionMs > 0);
+  assert.equal(logs.mock.callCount(), 0);
+
+  releaseCold.resolve();
+  await waitFor(() => logs.mock.callCount() === 1, "cold Get reaction success timing");
+  const cold = getTiming(logs.mock.calls[0].arguments[0]);
+  assert.equal(cold.attempts, 1);
+  assert.ok(cold.tokenMs > 0);
+  assert.ok(cold.reactionMs > 0);
+  for (const timing of [failedToken, cached, cold]) {
+    assert.equal(timing.backoffMs, 0);
+    assert.ok(timing.totalMs + 0.2 >= timing.localMs + timing.tokenMs + timing.reactionMs);
+  }
+  assert.equal(post.mock.callCount(), 2);
+  assert.deepEqual(request.mock.calls.map((call) => call.arguments[0].timeout), [2_500, 2_500]);
+});
+
 test("routes exact Feishu new-session text without using the classifier or runner", async (t) => {
   const fixture = createFixture(t, { classify: async () => {} });
   await fixture.dispatch(message("om_new_session", { text: " 新建会话 " }));
@@ -391,6 +480,7 @@ test("disabled Feishu reactions leave ordinary message delivery working", async 
 });
 
 test("a throttled reaction is retried independently from the task and reply", async (t) => {
+  const logs = t.mock.method(console, "log", () => {});
   let throttled = false;
   const fixture = createFixture(t, {
     reactionCode: (emoji) => {
@@ -406,6 +496,14 @@ test("a throttled reaction is retried independently from the task and reply", as
   const requests = fixture.steps.filter((step) => step.kind === "reaction-request" && step.emoji === "Get");
   assert.equal(requests.length, 2);
   assert.ok(requests[1].at - requests[0].at >= 300);
+  const acknowledged = logs.mock.calls
+    .map(({ arguments: [line] }) => String(line))
+    .filter((line) => line.startsWith("[codex-channel-bridge] Feishu Get acknowledged in "));
+  assert.equal(acknowledged.length, 1);
+  const timing = getTiming(acknowledged[0]);
+  assert.equal(timing.attempts, 2);
+  assert.ok(timing.backoffMs >= 300);
+  assert.ok(timing.totalMs + 0.1 >= timing.localMs + timing.backoffMs);
 });
 
 test("monitor shutdown cleans up an active Typing reaction", async (t) => {
