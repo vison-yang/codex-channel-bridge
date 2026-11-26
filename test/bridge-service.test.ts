@@ -15,6 +15,268 @@ import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { encryptAesEcb } from "../src/weixin/media.js";
 import { normalizeWeixinMessage } from "../src/weixin/messages.js";
 
+test("starts an unselected WeChat sender in the default workspace without binding another sender's thread", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-default-wechat-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const defaultWorkspace = path.join(root, "default");
+  const otherWorkspace = path.join(root, "other");
+  fs.mkdirSync(defaultWorkspace);
+  fs.mkdirSync(otherWorkspace);
+  const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const defaultProject = store.createProject("Default", defaultWorkspace);
+  const otherSession = store.createSession("bob@im.wechat", defaultWorkspace, "Bob's PC history", defaultProject.id);
+  store.setSessionThread(otherSession.id, "bob-pc-thread");
+  store.createProject("Unrelated", otherWorkspace);
+  const runs: Array<{ cwd: string; threadId?: string }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(defaultWorkspace), allowedWorkspaces: [root], allowedSenderIds: ["alice@im.wechat"] },
+    stateStore: store,
+    weixin: {
+      async sendTyping() {},
+      async sendText() { return { messageId: "sent" }; }
+    } as never,
+    listCodexSessions: () => [{
+      threadId: "desktop-thread",
+      workspace: defaultWorkspace,
+      lastUsedAt: "2099-08-01T09:00:00.000Z",
+      lastUserMessage: "Desktop history"
+    }],
+    runner: {
+      async run(input: { cwd: string; threadId?: string }) {
+        runs.push({ cwd: input.cwd, threadId: input.threadId });
+        return { raw: "", text: "完成", threadId: input.threadId ?? "alice-thread" };
+      },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string) => service.handleMessage({
+    id, senderId: "alice@im.wechat", contextToken: "ctx", text: "继续处理", raw: {}
+  });
+
+  await send("first");
+  await send("second");
+
+  assert.deepEqual(runs, [
+    { cwd: defaultWorkspace, threadId: undefined },
+    { cwd: defaultWorkspace, threadId: "alice-thread" }
+  ]);
+  assert.equal(store.getActiveProject("alice@im.wechat")?.id, defaultProject.id);
+  assert.equal(store.getActiveSession("alice@im.wechat")?.threadId, "alice-thread");
+  assert.equal(store.getSession(otherSession.id)?.threadId, "bob-pc-thread");
+  assert.equal(store.listProjects().filter((project) => project.workspace === defaultWorkspace).length, 1);
+});
+
+test("follows changed defaults until a manual project is selected and can return to the default thread", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-default-switch-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const [firstWorkspace, secondWorkspace, manualWorkspace] = ["first", "second", "manual"].map((name) => path.join(root, name));
+  for (const workspace of [firstWorkspace, secondWorkspace, manualWorkspace]) fs.mkdirSync(workspace);
+  const paths = resolveStatePaths(path.join(root, "state"));
+  let store = new RuntimeStateStore(paths);
+  const manualProject = store.createProject("Manual project", manualWorkspace);
+  const runs: Array<{ cwd: string; threadId?: string }> = [];
+  const replies: string[] = [];
+  const makeService = (defaultWorkspace: string) => new BridgeService({
+    config: { ...defaultConfig(defaultWorkspace), allowedWorkspaces: [root], allowedSenderIds: ["alice@im.wechat"] },
+    stateStore: store,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
+    } as never,
+    runner: {
+      async run(input: { cwd: string; threadId?: string }) {
+        runs.push({ cwd: input.cwd, threadId: input.threadId });
+        return { raw: "", text: "完成", threadId: input.threadId ?? `thread-${runs.length}` };
+      },
+      async stop() {}
+    } as never
+  });
+  let service = makeService(firstWorkspace);
+  const send = (id: string, text = "继续处理") => service.handleMessage({
+    id, senderId: "alice@im.wechat", contextToken: "ctx", text, raw: {}
+  });
+
+  await send("first-default");
+  store = new RuntimeStateStore(paths);
+  service = makeService(secondWorkspace);
+  await send("second-default");
+  await send("choose-manual", "/project Manual project");
+  assert.equal(store.getActiveProject("alice@im.wechat")?.id, manualProject.id);
+  await send("manual-first");
+  store = new RuntimeStateStore(paths);
+  service = makeService(firstWorkspace);
+  await send("manual-after-config-change");
+  const callsBeforeDefaultCommand = runs.length;
+  await send("return-default", "/project default");
+  assert.equal(runs.length, callsBeforeDefaultCommand);
+  assert.match(replies.at(-1) ?? "", /默认工作目录/);
+  assert.equal(store.getActiveProject("alice@im.wechat")?.workspace, firstWorkspace);
+  await send("default-again");
+  store = new RuntimeStateStore(paths);
+  service = makeService(secondWorkspace);
+  await send("second-default-again");
+
+  assert.deepEqual(runs, [
+    { cwd: firstWorkspace, threadId: undefined },
+    { cwd: secondWorkspace, threadId: undefined },
+    { cwd: manualWorkspace, threadId: undefined },
+    { cwd: manualWorkspace, threadId: "thread-3" },
+    { cwd: firstWorkspace, threadId: "thread-1" },
+    { cwd: secondWorkspace, threadId: "thread-2" }
+  ]);
+});
+
+test("keeps a legacy active project and its thread when a different default is configured", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-default-legacy-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const defaultWorkspace = path.join(root, "default");
+  const legacyWorkspace = path.join(root, "legacy");
+  fs.mkdirSync(defaultWorkspace);
+  fs.mkdirSync(legacyWorkspace);
+  const paths = resolveStatePaths(path.join(root, "state"));
+  let store = new RuntimeStateStore(paths);
+  const project = store.createProject("Legacy", legacyWorkspace);
+  const session = store.createSession("alice@im.wechat", legacyWorkspace, "Legacy session", project.id);
+  store.setSessionThread(session.id, "legacy-thread");
+  store = new RuntimeStateStore(paths);
+  const runs: Array<{ cwd: string; threadId?: string }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(defaultWorkspace), allowedWorkspaces: [root], allowedSenderIds: ["alice@im.wechat"] },
+    stateStore: store,
+    weixin: { async sendTyping() {}, async sendText() { return { messageId: "sent" }; } } as never,
+    runner: {
+      async run(input: { cwd: string; threadId?: string }) {
+        runs.push({ cwd: input.cwd, threadId: input.threadId });
+        return { raw: "", text: "完成", threadId: input.threadId };
+      },
+      async stop() {}
+    } as never
+  });
+  await service.handleMessage({ id: "legacy", senderId: "alice@im.wechat", text: "继续", raw: {} });
+  assert.deepEqual(runs, [{ cwd: legacyWorkspace, threadId: "legacy-thread" }]);
+  assert.equal(store.getActiveProject("alice@im.wechat")?.id, project.id);
+});
+
+test("rejects an unavailable or unauthorized default workspace without choosing another project", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-default-invalid-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const allowed = path.join(root, "allowed");
+  const outside = path.join(root, "outside");
+  const file = path.join(root, "file");
+  fs.mkdirSync(allowed);
+  fs.mkdirSync(outside);
+  fs.writeFileSync(file, "not a directory");
+  const outsideLink = path.join(allowed, "outside-link");
+  fs.symlinkSync(outside, outsideLink, "dir");
+  for (const [name, workspace, allowedWorkspaces] of [
+    ["missing", path.join(root, "missing"), [root]],
+    ["file", file, [root]],
+    ["not allowed", outside, [allowed]],
+    ["symlink outside", outsideLink, [allowed]]
+  ] as const) {
+    const store = new RuntimeStateStore(resolveStatePaths(path.join(root, `state-${name}`)));
+    const unrelated = store.createProject("Unrelated", allowed);
+    const replies: string[] = [];
+    let calls = 0;
+    const service = new BridgeService({
+      config: { ...defaultConfig(workspace), allowedWorkspaces: [...allowedWorkspaces], allowedSenderIds: ["alice@im.wechat"] },
+      stateStore: store,
+      weixin: { async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; } } as never,
+      runner: { async run() { calls += 1; return { raw: "", text: "不应执行" }; }, async stop() {} } as never
+    });
+    await service.handleMessage({ id: name, senderId: "alice@im.wechat", text: "开始", raw: {} });
+    assert.equal(calls, 0, name);
+    assert.equal(store.getActiveProject("alice@im.wechat"), undefined, name);
+    assert.equal(store.listSessions().length, 0, name);
+    assert.deepEqual(store.listProjects().map((project) => project.id), [unrelated.id], name);
+    assert.match(replies.at(-1) ?? "", /默认工作目录/, name);
+    assert.match(replies.at(-1) ?? "", /\/project/, name);
+  }
+});
+
+test("keeps a manually selected project when returning to an invalid default fails", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-default-invalid-manual-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = store.createProject("Manual project", root);
+  store.activateProject("alice@im.wechat", project.id);
+  const replies: string[] = [];
+  const runs: Array<{ cwd: string; threadId?: string }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(path.join(root, "missing")), allowedWorkspaces: [root], allowedSenderIds: ["alice@im.wechat"] },
+    stateStore: store,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
+    } as never,
+    runner: {
+      async run(input: { cwd: string; threadId?: string }) {
+        runs.push({ cwd: input.cwd, threadId: input.threadId });
+        return { raw: "", text: "完成", threadId: "manual-thread" };
+      },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({ id, senderId: "alice@im.wechat", text, raw: {} });
+  await send("bad-default", "/project default");
+  assert.match(replies.at(-1) ?? "", /默认工作目录/);
+  assert.equal(store.getActiveProject("alice@im.wechat")?.id, project.id);
+  assert.equal(runs.length, 0);
+  await send("manual", "继续");
+  assert.deepEqual(runs, [{ cwd: root, threadId: undefined }]);
+});
+
+test("does not use the previous automatic project after the configured default becomes invalid", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-default-invalid-change-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const paths = resolveStatePaths(path.join(root, "state"));
+  let store = new RuntimeStateStore(paths);
+  const replies: string[] = [];
+  const runs: Array<{ cwd: string; threadId?: string }> = [];
+  const makeService = (workspace: string) => new BridgeService({
+    config: { ...defaultConfig(workspace), allowedWorkspaces: [root], allowedSenderIds: ["alice@im.wechat"] },
+    stateStore: store,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
+    } as never,
+    runner: {
+      async run(input: { cwd: string; threadId?: string }) {
+        runs.push({ cwd: input.cwd, threadId: input.threadId });
+        return { raw: "", text: "完成", threadId: "old-default-thread" };
+      },
+      async stop() {}
+    } as never
+  });
+  let service = makeService(root);
+  const send = (id: string) => service.handleMessage({ id, senderId: "alice@im.wechat", text: "继续", raw: {} });
+  await send("valid");
+  store = new RuntimeStateStore(paths);
+  service = makeService(path.join(root, "missing"));
+  await send("invalid");
+  assert.deepEqual(runs, [{ cwd: root, threadId: undefined }]);
+  assert.match(replies.at(-1) ?? "", /默认工作目录/);
+  assert.match(replies.at(-1) ?? "", /\/project/);
+});
+
+test("new creates a session in the default workspace without running a turn", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-default-new-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  let calls = 0;
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore: store,
+    weixin: { async sendText() { return { messageId: "sent" }; } } as never,
+    runner: { async run() { calls += 1; return { raw: "", text: "不应执行" }; }, async stop() {} } as never
+  });
+  await service.handleMessage({ id: "new", senderId: "alice@im.wechat", text: "/new", raw: {} });
+  assert.equal(calls, 0);
+  assert.equal(store.getActiveProject("alice@im.wechat")?.workspace, root);
+  assert.equal(store.getActiveSession("alice@im.wechat")?.workspace, root);
+  assert.equal(store.getActiveSession("alice@im.wechat")?.threadId, undefined);
+});
+
 test("reports WeChat Codex turn status and resolves runtime details for status", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-status-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -1338,13 +1600,11 @@ test("authorized WeChat can add, list, and switch Codex projects", async (t) => 
     raw: {}
   });
 
-  // Commands and ordinary messages on a fresh account do not create a default-directory project.
+  // Read-only commands on a fresh account do not create a default-directory project.
   for (const [id, text] of [
     ["project-help", "/help"],
     ["project-status", "/status"],
-    ["project-new", "/new"],
-    ["project-model", "/model"],
-    ["project-message", "开始处理任务"]
+    ["project-model", "/model"]
   ]) {
     await sendWithProjects(id, text);
     assert.equal(stateStore.listProjects().length, 0);

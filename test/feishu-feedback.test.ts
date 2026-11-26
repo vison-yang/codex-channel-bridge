@@ -22,7 +22,7 @@ type Step = {
   reactionId?: string;
 };
 
-type RunInput = Pick<CodexRunnerInput, "prompt" | "onExecutionStarted" | "onActivity" | "onFinalAnswerDelta" | "onProgress">;
+type RunInput = Pick<CodexRunnerInput, "cwd" | "threadId" | "prompt" | "onExecutionStarted" | "onActivity" | "onFinalAnswerDelta" | "onProgress">;
 type RunResult = { raw: string; text: string; threadId?: string };
 type MessageResult = { code: number; data?: { message_id: string } };
 
@@ -53,6 +53,7 @@ function message(id: string, options: { actor?: string; chat?: string; image?: b
 }
 
 function createFixture(t: TestContext, options: {
+  unselected?: boolean;
   reactions?: boolean;
   progressCards?: boolean;
   streamingReplies?: boolean;
@@ -66,8 +67,14 @@ function createFixture(t: TestContext, options: {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-feishu-feedback-"));
   const paths = resolveStatePaths(path.join(root, "state"));
   const store = new RuntimeStateStore(paths);
-  const project = store.createProject("Feedback test", root);
-  store.activateProject("oc_test", project.id);
+  if (options.unselected) {
+    const otherWorkspace = path.join(root, "other");
+    fs.mkdirSync(otherWorkspace);
+    store.createProject("Unrelated", otherWorkspace);
+  } else {
+    const project = store.createProject("Feedback test", root);
+    store.activateProject("oc_test", project.id);
+  }
   const steps: Step[] = [];
   const errors: unknown[] = [];
   const record = (kind: string, detail: Omit<Step, "kind" | "at"> = {}) => {
@@ -192,6 +199,7 @@ function createFixture(t: TestContext, options: {
   const handler = dispatcher.handles.get("im.message.receive_v1");
   assert.ok(handler);
   return {
+    root,
     store,
     steps,
     errors,
@@ -201,6 +209,31 @@ function createFixture(t: TestContext, options: {
       step.kind === kind && (!messageId || step.messageId === messageId) && (!emoji || step.emoji === emoji))
   };
 }
+
+test("a Feishu message without a project creates a default-workspace conversation scoped to its chat", async (t) => {
+  const runs: Array<{ cwd: string; threadId?: string }> = [];
+  const fixture = createFixture(t, {
+    unselected: true,
+    run: async (input) => {
+      runs.push({ cwd: input.cwd, threadId: input.threadId });
+      input.onExecutionStarted?.();
+      return { raw: "", text: "answer", threadId: input.threadId ?? "feishu-thread" };
+    }
+  });
+
+  await fixture.dispatch(message("om_default_first"));
+  await fixture.dispatch(message("om_default_second"));
+
+  assert.deepEqual(runs, [
+    { cwd: fixture.root, threadId: undefined },
+    { cwd: fixture.root, threadId: "feishu-thread" }
+  ]);
+  assert.equal(fixture.store.getActiveSession("oc_test")?.threadId, "feishu-thread");
+  assert.equal(fixture.store.getActiveSession("ou_allowed"), undefined);
+  assert.equal(fixture.store.getActiveProject("oc_test")?.workspace, fixture.root);
+  assert.equal(fixture.store.listProjects().filter((project) => project.workspace === fixture.root).length, 1);
+  assert.deepEqual(fixture.errors, []);
+});
 
 test("acknowledges a direct message before classification and marks success only after delivery", async (t) => {
   const classification = deferred<void>();

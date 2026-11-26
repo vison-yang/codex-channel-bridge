@@ -185,7 +185,7 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
   ]);
   assert.deepEqual(
     cards[1].actionGroups.flatMap((group) => group.map((action) => action.value.arg)),
-    ["P1", "P2"]
+    ["P1", "P2", "default"]
   );
   assert.deepEqual(
     cards[4].actionGroups.flatMap((group) => group.map((action) => action.value.arg)),

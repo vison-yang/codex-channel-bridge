@@ -138,6 +138,7 @@ Selecting a session reads its user messages and final replies from Codex's own p
 The UI uses local remarks instead of treating internal IDs as account names. Expand “Account IDs” on an account card to inspect its iLink Bot ID and User ID; Codex thread IDs remain hidden from the regular UI. Each account can have a local remark edited from the WeChat Accounts page; the remark is reused by session tabs, with `WeChat Account 1` used only as a fallback. The current QR and messaging APIs do not expose WeChat nicknames, avatars, or a profile lookup endpoint, so the page uses a default icon.
 
 - Each authorized WeChat account has one active session and may own multiple named sessions.
+- WeChat and Feishu messages use the selected project when one is set. Otherwise, the bridge uses the default workspace in Settings and continues the sender's existing session there or creates one. Send `/project default` to return to the default workspace.
 - Activate chooses which Codex thread receives the sender's next message.
 - Reset clears the recorded thread so the next message starts fresh context.
 - Delete removes only the bridge record, not Codex's own history files.
@@ -147,12 +148,12 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 
 ## Projects, running tasks, and notifications
 
-- Projects are selected from local Codex history and grouped by working directory. Switching projects limits the session list to that project's ten most recently active sessions.
+- Users can add projects from local Codex history. The bridge also creates a project on demand for the default workspace. The session list shows the active project's ten most recently used sessions.
 - The console shows bound sessions and currently running tasks while monitoring Codex Desktop, Web, and chat session lifecycle changes.
 - Each project can send completion summaries to a selected channel recipient after success, failure, or interruption.
 - A green bell and “Notifications enabled” badge confirm the setting. The task count represents live tasks, not historical sessions.
 
-Channel users select a project once, then use native controls to enter the session, task, or Q&A modes enabled for that channel account; project selection enters the configured default mode. Task mode resolves the Taskboard project by the selected project's absolute workspace and does not require an existing Codex session. Q&A prefers the project's bound knowledge base and otherwise uses the channel account's managed knowledge base or validated llm-wiki directory while keeping the selected project as the working directory. Plan mode and goals belong to the current project's active thread and never fall through to a thread from another project. See the [channel project workbench specification](./docs/channel-project-modes.md) for the state and acceptance contract.
+Channel users can use native controls to switch projects or enter the session, task, or Q&A modes enabled for that channel account. Project selection enters the configured default mode. Task mode resolves the Taskboard project by the selected project's absolute workspace and does not require an existing Codex session. Q&A prefers the project's bound knowledge base and otherwise uses the channel account's managed knowledge base or validated llm-wiki directory while keeping the selected project as the working directory. Plan mode and goals belong to the current project's active thread and never fall through to a thread from another project. See the [channel project workbench specification](./docs/channel-project-modes.md) for the state and acceptance contract.
 
 ## Taskboard integration
 
@@ -181,6 +182,7 @@ Natural language is the default entry point. The classifier receives the authent
 /project list    /p l         List projects bound to this WeChat account
 /project add     /p a         List projects available from Codex history
 /project add C1  /p a C1      Add a Codex-history project by C code
+/project default              Return to the workspace configured in Settings
 /project P1      /p P1        Switch to a bound project
 /project rename P1|name /p rn P1|name  Rename a project
 /project delete P1      /p d P1        Remove a project with no running tasks

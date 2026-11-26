@@ -53,7 +53,7 @@ import {
   LlmWikiMcpClientPool,
   llmWikiDynamicTools
 } from "../knowledge/llm-wiki-mcp-client.js";
-import type { CodexWeixinConfig } from "../state/config.js";
+import { isWorkspaceAllowed, type CodexWeixinConfig } from "../state/config.js";
 import {
   normalizeChannelModeSettings,
   type ChannelModeSettings,
@@ -97,6 +97,8 @@ type ProjectSessionChoice = {
   title: string;
   updatedAt: string;
 };
+
+type BoundProjectContext = { project: ManagedProject } | { problem?: string };
 
 export type BridgeServiceOptions = {
   config: CodexWeixinConfig;
@@ -236,10 +238,16 @@ export class BridgeService {
         }
         if (
           commandProjectRequirement(command) === "required"
-          && !this.ensureBoundProjectContext(replyTargetId)
+          && (isReservedChannelCommandToken(command.name)
+            || channelCapabilities.some((capability) => capability.commandName === command.name))
         ) {
-          await this.replyProjectRequired(replyTargetId);
-          return;
+          const canCreateDefault = requiredMode === "session" || command.name === "prompt"
+            || (continueAsConversation && friendlyCommandsContinueConversation([command]));
+          const context = this.ensureBoundProjectContext(replyTargetId, canCreateDefault ? "create" : "existing");
+          if (!("project" in context)) {
+            await this.replyProjectRequired(replyTargetId, context.problem);
+            return;
+          }
         }
         if (
           continueAsConversation
@@ -254,8 +262,9 @@ export class BridgeService {
       if (!continueAsConversation) return;
     }
 
-    if (!this.ensureBoundProjectContext(replyTargetId)) {
-      await this.replyProjectRequired(replyTargetId);
+    const context = this.ensureBoundProjectContext(replyTargetId, "create");
+    if (!("project" in context)) {
+      await this.replyProjectRequired(replyTargetId, context.problem);
       return;
     }
 
@@ -290,7 +299,7 @@ export class BridgeService {
     const resolver = this.options.intentResolver;
     if (!resolver || !text.trim()) return undefined;
     const projects = this.options.stateStore.listProjects();
-    const activeProject = this.options.stateStore.getActiveProject(conversationId);
+    const activeProject = this.currentProject(conversationId);
     const knowledgeBaseName = activeProject ? this.resolveQaContext(activeProject)?.name : undefined;
     const currentProjectName = activeProject?.name;
     const currentMode = this.options.stateStore.getInteractionMode(conversationId);
@@ -452,28 +461,82 @@ export class BridgeService {
     }
   }
 
-  private async replyProjectRequired(senderId: string): Promise<void> {
-    const fallbackText = "还没有绑定 Codex 项目。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。";
+  private async replyProjectRequired(senderId: string, problem?: string): Promise<void> {
+    const detail = problem ?? "当前对话还没有绑定 Codex 项目。";
+    const guidance = problem
+      ? "可选择已有项目，或在管理页检查默认工作目录和允许的工作目录。"
+      : "可选择已有项目，或使用设置中的默认工作目录。";
     await this.replyActionCard(senderId, createChoiceCard({
-      title: "先添加一个 Codex 项目",
-      body: "还没有绑定项目。点击下方按钮，从 Codex 历史项目中选择。",
-      fallbackText,
-      choices: [{ label: "选择历史项目", command: "project", arg: "add", style: "primary" }]
+      title: problem ? "默认工作目录不可用" : "先选择一个 Codex 项目",
+      body: `${detail}\n\n${guidance}`,
+      fallbackText: `${detail}\n${guidance}\n发送 /project list 查看项目。${problem ? "" : "发送 /project default 使用默认目录。"}`,
+      choices: problem
+        ? [{ label: "选择项目", command: "project", arg: "list", style: "primary" }]
+        : [
+          { label: "选择项目", command: "project", arg: "list", style: "primary" },
+          { label: "使用默认目录", command: "project", arg: "default" }
+        ]
     }));
   }
 
-  private ensureBoundProjectContext(senderId: string): boolean {
-    const projects = this.options.stateStore.listProjects();
-    const activeProject = this.options.stateStore.getActiveProject(senderId);
-    if (activeProject && projects.some((project) => project.id === activeProject.id)) {
+  private ensureBoundProjectContext(
+    senderId: string,
+    defaultBinding: "existing" | "create" | "explicit"
+  ): BoundProjectContext {
+    const { stateStore } = this.options;
+    const activeProject = stateStore.getActiveProject(senderId);
+    const isFollowingDefault = stateStore.isActiveProjectDefault(senderId);
+    if (activeProject && !isFollowingDefault && defaultBinding !== "explicit") {
       this.ensureEnabledMode(senderId);
-      return true;
+      return { project: activeProject };
     }
-    const project = projects[0];
-    if (!project) return false;
-    this.options.stateStore.activateProject(senderId, project.id);
-    this.options.stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
-    return true;
+
+    const resolved = this.resolveDefaultWorkspace();
+    if ("problem" in resolved) return resolved;
+    if (isFollowingDefault && activeProject?.workspace === resolved.workspace) {
+      this.ensureEnabledMode(senderId);
+      return { project: activeProject };
+    }
+
+    const project = stateStore.activateDefaultProject(senderId, resolved.workspace, defaultBinding !== "existing");
+    if (!project) return {};
+    if (!activeProject || !isFollowingDefault) {
+      stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
+    } else {
+      this.ensureEnabledMode(senderId);
+    }
+    return { project };
+  }
+
+  private defaultWorkspacePath(): string | undefined {
+    const { defaultCwd } = this.options.config;
+    return typeof defaultCwd === "string" && defaultCwd.trim() ? path.resolve(defaultCwd) : undefined;
+  }
+
+  private resolveDefaultWorkspace(): { workspace: string } | { problem: string } {
+    const workspace = this.defaultWorkspacePath();
+    if (!workspace) return { problem: "尚未配置默认工作目录。" };
+    const { allowedWorkspaces } = this.options.config;
+    const outsideAllowed = { problem: `默认工作目录不在允许的工作目录范围内：${workspace}` };
+    if (!isWorkspaceAllowed(workspace, allowedWorkspaces)) return outsideAllowed;
+
+    const realWorkspace = existingDirectoryPath(workspace);
+    if (!realWorkspace) return { problem: `默认工作目录不存在、无法访问或不是目录：${workspace}` };
+    // 同时检查符号链接目标，避免从允许目录经链接进入未授权目录。
+    if (realWorkspace !== workspace) {
+      const allowedRoots = allowedWorkspaces.map(existingDirectoryPath).filter((root) => root !== undefined);
+      if (!isWorkspaceAllowed(realWorkspace, allowedRoots)) return outsideAllowed;
+    }
+    return { workspace };
+  }
+
+  private currentProject(senderId: string): ManagedProject | undefined {
+    const { stateStore } = this.options;
+    const project = stateStore.getActiveProject(senderId);
+    if (stateStore.isActiveProjectDefault(senderId) && project?.workspace !== this.defaultWorkspacePath()) {
+      return undefined;
+    }
+    return project;
   }
 
   private ensureEnabledMode(senderId: string): void {
@@ -485,6 +548,23 @@ export class BridgeService {
 
   private async handleProjectCommand(senderId: string, arg: string): Promise<void> {
     const input = arg.trim();
+    if (input.toLowerCase() === "default") {
+      const context = this.ensureBoundProjectContext(senderId, "explicit");
+      if (!("project" in context)) {
+        await this.replyProjectRequired(senderId, context.problem);
+        return;
+      }
+      const { project } = context;
+      const title = "已恢复跟随默认工作目录";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title,
+        template: "green",
+        body: `项目：${project.name}\n${project.workspace}\n\n直接发送消息即可继续。`,
+        fallbackText: `${title}：${project.name}\n${project.workspace}\n直接发送消息即可继续。`,
+        choices: this.modeChoices(this.options.stateStore.getInteractionMode(senderId))
+      }));
+      return;
+    }
     const addMatch = /^(?:add|a)(?:\s+(.*))?$/i.exec(input);
     if (addMatch) {
       const existingWorkspaces = new Set(
@@ -554,18 +634,21 @@ export class BridgeService {
       return;
     }
     if (!input || input.toLowerCase() === "list" || input.toLowerCase() === "l") {
-      const activeProjectId = this.options.stateStore.getActiveProject(senderId)?.id;
+      const activeProjectId = this.currentProject(senderId)?.id;
       const fallbackText = (projects.length
         ? ["已绑定的 Codex 项目：", ...projects.map((project, index) =>
           `[P${index + 1}] ${project.id === activeProjectId ? "【当前】" : ""}${project.name}\n   ${project.workspace}`
-        ), "", "发送 /project P1 切换项目。"]
-        : ["还没有绑定 Codex 项目。", "发送 /project add 查看可从 Codex 历史添加的项目。"]).join("\n");
+        ), "", "发送 /project P1 切换项目。", "发送 /project default 使用默认目录。"]
+        : ["还没有绑定 Codex 项目。", "发送 /project default 使用默认目录，或发送 /project add 查看历史项目。"]).join("\n");
       if (!projects.length) {
         await this.replyActionCard(senderId, createChoiceCard({
           title: "选择 Codex 项目",
-          body: "还没有绑定项目，可以从 Codex 历史记录中添加。",
+          body: "还没有绑定项目。可使用设置中的默认工作目录，或从 Codex 历史记录中添加。",
           fallbackText,
-          choices: [{ label: "添加历史项目", command: "project", arg: "add", style: "primary" }]
+          choices: [
+            { label: "使用默认目录", command: "project", arg: "default", style: "primary" },
+            { label: "添加历史项目", command: "project", arg: "add" }
+          ]
         }));
         return;
       }
@@ -573,11 +656,14 @@ export class BridgeService {
         title: "选择 Codex 项目",
         body: projects.map((project) => `${project.id === activeProjectId ? `**当前 · ${project.name}**` : `**${project.name}**`}\n${project.workspace}`).join("\n\n"),
         command: "project",
-        choices: projects.map((project, index) => ({
-          label: conciseButtonLabel(project.name),
-          arg: `P${index + 1}`,
-          active: project.id === activeProjectId
-        })),
+        choices: [
+          ...projects.map((project, index) => ({
+            label: conciseButtonLabel(project.name),
+            arg: `P${index + 1}`,
+            active: project.id === activeProjectId
+          })),
+          { label: "使用默认目录", arg: "default" }
+        ],
         fallbackText
       }));
       return;
@@ -1702,10 +1788,14 @@ export class BridgeService {
   }
 
   private async statusText(senderId: string, isFeishu: boolean): Promise<string> {
-    const mode = this.options.stateStore.getInteractionMode(senderId);
-    const project = this.options.stateStore.getActiveProject(senderId);
-    const session = this.executionSession(senderId);
-    const workspace = project?.workspace ?? session?.workspace ?? this.options.config.defaultCwd;
+    const { stateStore } = this.options;
+    const mode = stateStore.getActiveProject(senderId)
+      ? stateStore.getInteractionMode(senderId)
+      : this.modeSettings.defaultMode;
+    const project = this.currentProject(senderId);
+    const session = project ? this.executionSession(senderId) : undefined;
+    const workspace = project?.workspace ?? this.defaultWorkspacePath() ?? "未配置";
+    const isDefault = !project || stateStore.isActiveProjectDefault(senderId);
     const knowledgeBase = project ? this.resolveQaContext(project) : undefined;
     let issue: TaskboardIssue | undefined;
     if (project && session?.threadId && this.options.taskboard) {
@@ -1727,7 +1817,7 @@ export class BridgeService {
       `任务：${issue ? `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}` : "尚未绑定 Taskboard Issue"}`,
       `会话：${session?.title ?? "新会话"}`,
       `对话状态：${session?.collaborationMode === "plan" ? "计划协作" : "普通对话（未附加模式）"}`,
-      `工作目录：${workspace}`,
+      `工作目录：${workspace}${isDefault ? "（默认）" : ""}`,
       `thread：${session?.threadId || "尚未创建"}`,
       `backend：${this.options.config.codexBackend}`,
       `exec sandbox：${this.options.config.codexExecSandbox ?? "Codex 默认"}`,
@@ -1757,13 +1847,18 @@ export class BridgeService {
   }
 
   private async effectiveRuntime(senderId: string): Promise<CodexRuntimeInfo> {
-    const session = this.executionSession(senderId);
-    const workspace = session?.workspace ?? this.options.config.defaultCwd;
+    const project = this.currentProject(senderId);
+    const session = project ? this.executionSession(senderId) : undefined;
+    const target = project && !this.options.stateStore.isActiveProjectDefault(senderId)
+      ? { workspace: session?.workspace ?? project.workspace }
+      : this.resolveDefaultWorkspace();
     let runtime: CodexRuntimeInfo = {};
-    try {
-      runtime = await this.runner.getRuntimeInfo(workspace, session?.threadId);
-    } catch (error) {
-      console.warn(`Codex runtime info unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    if ("workspace" in target) {
+      try {
+        runtime = await this.runner.getRuntimeInfo(target.workspace, session?.threadId);
+      } catch (error) {
+        console.warn(`Codex runtime info unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     return {
       model: session?.model ?? this.options.config.model ?? runtime.model,
@@ -1894,6 +1989,14 @@ export class BridgeService {
 
   requestApproval(senderId: string, request: CodexApprovalRequest, signal?: AbortSignal): Promise<CodexApprovalDecision> {
     return this.approvals.request(senderId, request, signal);
+  }
+}
+
+function existingDirectoryPath(workspace: string): string | undefined {
+  try {
+    return fs.statSync(workspace).isDirectory() ? fs.realpathSync(workspace) : undefined;
+  } catch {
+    return undefined;
   }
 }
 

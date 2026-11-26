@@ -4,6 +4,8 @@ import type { ChannelCommand } from "./channel-intent.js";
 const PROJECT_OPTIONAL_COMMANDS = new Set<string>([
   "help",
   "h",
+  "status",
+  "where",
   "balance",
   "memory",
   "knowledge",

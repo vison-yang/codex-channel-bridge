@@ -8,14 +8,14 @@ import {
   requiredModeForCommand
 } from "../src/bridge/channel-command-policy.js";
 
-test("preserves the exact project-free command policy", () => {
+test("keeps help and status available without requiring a project", () => {
   const projectFree = [
-    "help", "h", "balance", "memory", "knowledge", "project", "projects", "approve", "reject", "answer"
+    "help", "h", "status", "where", "balance", "memory", "knowledge", "project", "projects", "approve", "reject", "answer"
   ];
   for (const name of projectFree) {
     assert.equal(commandProjectRequirement({ name, arg: "" }), "optional");
   }
-  for (const name of ["status", "task", "qa", "mode", "sessions", "goal"]) {
+  for (const name of ["task", "qa", "mode", "sessions", "goal"]) {
     assert.equal(commandProjectRequirement({ name, arg: "" }), "required");
   }
 });

@@ -81,6 +81,7 @@ export type RuntimeState = {
   activeSessionIds: Record<string, string>;
   activeQaSessionIds: Record<string, string>;
   activeProjectIds: Record<string, string>;
+  activeDefaultProjectIds: Record<string, string>;
   interactionModes: Record<string, ProjectInteractionMode>;
   pendingDeliveries: Array<{
     id: string;
@@ -104,6 +105,7 @@ export function emptyRuntimeState(): RuntimeState {
     activeSessionIds: {},
     activeQaSessionIds: {},
     activeProjectIds: {},
+    activeDefaultProjectIds: {},
     interactionModes: {},
     pendingDeliveries: [],
     knowledge: [],
@@ -478,8 +480,26 @@ export class RuntimeStateStore {
   activateProject(senderId: string, projectId: string): ManagedProject {
     const project = this.mutableProject(projectId);
     this.state.activeProjectIds[senderId] = project.id;
+    delete this.state.activeDefaultProjectIds[senderId];
     this.save();
     return structuredClone(project);
+  }
+
+  activateDefaultProject(senderId: string, workspace: string, allowCreate = true): ManagedProject | undefined {
+    const resolved = path.resolve(workspace);
+    const project = allowCreate
+      ? this.projectForWorkspace(resolved)
+      : this.state.projects.find((candidate) => candidate.workspace === resolved);
+    if (!project) return undefined;
+    this.state.activeProjectIds[senderId] = project.id;
+    this.state.activeDefaultProjectIds[senderId] = project.id;
+    this.save();
+    return structuredClone(project);
+  }
+
+  isActiveProjectDefault(senderId: string): boolean {
+    const defaultProjectId = this.state.activeDefaultProjectIds[senderId];
+    return Boolean(defaultProjectId) && defaultProjectId === this.state.activeProjectIds[senderId];
   }
 
   getActiveProject(senderId: string): ManagedProject | undefined {
@@ -521,7 +541,10 @@ export class RuntimeStateStore {
     }
     this.state.projects = this.state.projects.filter((project) => project.id !== projectId);
     for (const [senderId, activeProjectId] of Object.entries(this.state.activeProjectIds)) {
-      if (activeProjectId === projectId) delete this.state.activeProjectIds[senderId];
+      if (activeProjectId === projectId) {
+        delete this.state.activeProjectIds[senderId];
+        delete this.state.activeDefaultProjectIds[senderId];
+      }
     }
     this.save();
   }
@@ -582,7 +605,7 @@ export class RuntimeStateStore {
       updatedAt: now
     };
     this.state.sessions.push(session);
-    this.state.activeProjectIds[senderId] = project.id;
+    this.setSessionProject(senderId, project.id);
     if (mode === "qa") this.state.activeQaSessionIds[senderId] = session.id;
     else this.state.activeSessionIds[senderId] = session.id;
     this.save();
@@ -614,7 +637,7 @@ export class RuntimeStateStore {
     const session = this.mutableSession(sessionId);
     if (session.mode === "qa") this.state.activeQaSessionIds[session.senderId] = session.id;
     else this.state.activeSessionIds[session.senderId] = session.id;
-    if (session.projectId) this.state.activeProjectIds[session.senderId] = session.projectId;
+    if (session.projectId) this.setSessionProject(session.senderId, session.projectId);
     session.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(session);
@@ -706,6 +729,14 @@ export class RuntimeStateStore {
     return knowledgeBase;
   }
 
+  private setSessionProject(senderId: string, projectId: string): void {
+    // 会话仍在同一项目时，保留原先跟随默认目录的选择。
+    if (this.state.activeDefaultProjectIds[senderId] !== projectId) {
+      delete this.state.activeDefaultProjectIds[senderId];
+    }
+    this.state.activeProjectIds[senderId] = projectId;
+  }
+
   private projectForWorkspace(workspace: string): ManagedProject {
     const existing = this.state.projects.find((project) => project.workspace === workspace);
     if (existing) return existing;
@@ -783,7 +814,7 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     ...emptyRuntimeState(),
     ...value,
     pairedSenderIds: Array.isArray(value.pairedSenderIds) ? value.pairedSenderIds : [],
-    authorizedConversationsByActor: normalizeAuthorizedConversations(value.authorizedConversationsByActor),
+    authorizedConversationsByActor: normalizeStringRecord(value.authorizedConversationsByActor),
     processedMessageIds: Array.isArray(value.processedMessageIds)
       ? value.processedMessageIds.filter((id): id is string => typeof id === "string").slice(-1_000)
       : [],
@@ -794,6 +825,7 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     activeSessionIds: value.activeSessionIds && typeof value.activeSessionIds === "object" ? value.activeSessionIds : {},
     activeQaSessionIds: value.activeQaSessionIds && typeof value.activeQaSessionIds === "object" ? value.activeQaSessionIds : {},
     activeProjectIds: value.activeProjectIds && typeof value.activeProjectIds === "object" ? value.activeProjectIds : {},
+    activeDefaultProjectIds: normalizeStringRecord(value.activeDefaultProjectIds),
     interactionModes: normalizeInteractionModes(value.interactionModes),
     pendingDeliveries: Array.isArray(value.pendingDeliveries) ? value.pendingDeliveries : [],
     knowledge: Array.isArray(value.knowledge) ? value.knowledge : [],
@@ -801,7 +833,7 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
   };
 }
 
-function normalizeAuthorizedConversations(value: unknown): Record<string, string> {
+function normalizeStringRecord(value: unknown): Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => (
     Boolean(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1])

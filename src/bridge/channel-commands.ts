@@ -36,6 +36,7 @@ const BUILT_IN_HELP_LINES = [
   "/memory（/mem）[on|off|f K编号|c] - 管理账号个人记忆（与 llm-wiki 分开）",
   "/project（/p）[l|P编号] - 查看或切换已绑定项目",
   "/project add（/p a）[C编号] - 查看或添加 Codex 历史项目",
+  "/project default - 回到默认工作目录",
   "/project rename（/p rn）P1|新名称 - 重命名项目",
   "/project delete（/p d）P1 - 移除没有任务的项目",
   "/mode（/v）[session|task|qa] - 查看或切换当前项目工作模式",
